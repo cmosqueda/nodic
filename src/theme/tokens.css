@@ -1,0 +1,21 @@
+:root {
+  --nodic-ink: #102d3d;
+  --nodic-signal: #167a92;
+  --nodic-current: #69c4c8;
+  --nodic-paper: #eef4f6;
+  --nodic-white: #fbfdfd;
+  --nodic-coral: #e66b55;
+  --nodic-amber: #e8a83f;
+  --nodic-muted: #6f838c;
+  --nodic-line: #cddcdf;
+  --nodic-shadow: 0 14px 32px rgba(16, 45, 61, 0.08);
+  --display-font: "Arial Narrow", "Aptos Display", "Roboto Condensed", sans-serif;
+  --body-font: "Aptos", "Segoe UI", sans-serif;
+  --utility-font: "Cascadia Mono", "Roboto Mono", monospace;
+  --ion-font-family: var(--body-font);
+  --ion-background-color: var(--nodic-paper);
+  --ion-text-color: var(--nodic-ink);
+  --ion-color-primary: #167a92;
+  --ion-color-primary-rgb: 22, 122, 146;
+  --ion-color-primary-contrast: #ffffff;
+}

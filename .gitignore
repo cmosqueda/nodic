@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.idea/
+.vscode/
+*.iml
+*.log
+.DS_Store
+android/.gradle/
+android/local.properties
+android/app/build/
+android/build/
+coverage/
+*.db
+*.sqlite
