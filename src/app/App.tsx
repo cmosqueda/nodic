@@ -1,4 +1,4 @@
-import { IonApp, IonRouterOutlet } from '@ionic/react';
+import { IonApp } from '@ionic/react';
 import { IonReactRouter } from '@ionic/react-router';
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { WorkspaceProvider } from './workspace-context';
@@ -14,15 +14,13 @@ export default function App() {
       <WorkspaceProvider>
         <IonReactRouter>
           <AppShell>
-            <IonRouterOutlet id="main-content">
-              <Routes>
-                <Route path="/board" element={<BoardPage />} />
-                <Route path="/chat" element={<ChatPage />} />
-                <Route path="/members" element={<MembersPage />} />
-                <Route path="/network" element={<NetworkPage />} />
-                <Route path="*" element={<Navigate to="/board" replace />} />
-              </Routes>
-            </IonRouterOutlet>
+            <Routes>
+              <Route path="/board" element={<BoardPage />} />
+              <Route path="/chat" element={<ChatPage />} />
+              <Route path="/members" element={<MembersPage />} />
+              <Route path="/network" element={<NetworkPage />} />
+              <Route path="*" element={<Navigate to="/board" replace />} />
+            </Routes>
           </AppShell>
         </IonReactRouter>
       </WorkspaceProvider>

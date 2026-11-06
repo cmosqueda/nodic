@@ -3,7 +3,7 @@ import type { EventType, NodicEvent, TaskPriority, TaskStatus } from '../../prot
 import { canAuthorEvent, canChangeTaskStatus } from '../domain/permissions/permissions';
 import { applyEventToState, createInitialMaterializedState, type MaterializedState } from '../domain/reducers/event-reducer';
 import { calculateContiguousSummary, selectEventsForRanges, type MissingRange } from '../domain/sync/sync-engine';
-import type { Channel, Member, Message, Task, WorkspaceSnapshot } from '../domain/models';
+import type { Channel, ChannelSummary, Member, Message, Task, WorkspaceSnapshot } from '../domain/models';
 import { openNodicDatabase, type NodicDatabase } from './client';
 import { nativeSync } from '../services/native-sync';
 import { demoWorkspace } from '../services/demo-data';
@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS task_field_versions (
 export class NodicRepository {
   private nodicDb: NodicDatabase | null = null;
   private memoryState: MaterializedState | null = null;
+  private memoryChannels = new Map<string, MaterializedState>();
   private identity: DeviceIdentityRecord | null = null;
   private authorSequence = 0;
 
@@ -228,8 +229,53 @@ export class NodicRepository {
          ON CONFLICT(channel_id, device_id) DO UPDATE SET display_name=excluded.display_name, status='ACTIVE'`,
         [channelId, identity.deviceId, identity.displayName, identity.publicSigningKey],
       );
+    } else {
+      const channel: Channel = {
+        id: channelId,
+        name: effectiveName,
+        description: null,
+        currentUserDeviceId: identity.deviceId,
+        leadDeviceId: effectiveLead,
+        members: [{
+          deviceId: identity.deviceId,
+          displayName: identity.displayName,
+          role: 'MEMBER',
+          presence: 'ONLINE',
+          initials: identity.displayName.slice(0, 2).toUpperCase(),
+        }],
+      };
+      const matState = createInitialMaterializedState(channel);
+      this.memoryChannels.set(channelId, matState);
+      this.memoryState = matState;
     }
     this.memoryState = null;
+    return this.loadWorkspace(channelId);
+  }
+
+  async listChannels(): Promise<ChannelSummary[]> {
+    if (this.nodicDb) {
+      const res = await this.nodicDb.connection.query(
+        'SELECT id, name, description, lead_device_id FROM channels ORDER BY created_at DESC',
+      );
+      return (res.values ?? []).map((r) => ({
+        id: r.id as string,
+        name: r.name as string,
+        description: (r.description as string) ?? null,
+        leadDeviceId: r.lead_device_id as string | undefined,
+      }));
+    }
+    if (this.memoryState?.channel && !this.memoryChannels.has(this.memoryState.channel.id)) {
+      this.memoryChannels.set(this.memoryState.channel.id, this.memoryState);
+    }
+    return Array.from(this.memoryChannels.values()).map((s) => ({
+      id: s.channel.id,
+      name: s.channel.name,
+      description: s.channel.description,
+      leadDeviceId: s.channel.currentUserDeviceId,
+    }));
+  }
+
+  async switchChannel(channelId: string): Promise<WorkspaceSnapshot> {
     return this.loadWorkspace(channelId);
   }
 
@@ -249,6 +295,7 @@ export class NodicRepository {
         DELETE FROM events;
       `, false);
     }
+    this.memoryChannels.clear();
     this.memoryState = null;
     return { channel: null, tasks: [], messages: [] };
   }
@@ -322,6 +369,13 @@ export class NodicRepository {
       return { channel, tasks, messages };
     }
 
+    // Memory / browser fallback: load target or active channel from memoryChannels
+    if (targetChannelId && this.memoryChannels.has(targetChannelId)) {
+      this.memoryState = this.memoryChannels.get(targetChannelId)!;
+    } else if (this.memoryChannels.size > 0 && (!this.memoryState || !this.memoryChannels.has(this.memoryState.channel.id))) {
+      this.memoryState = Array.from(this.memoryChannels.values())[0];
+    }
+
     if (!this.memoryState) {
       return { channel: null, tasks: [], messages: [] };
     }
@@ -374,7 +428,9 @@ export class NodicRepository {
       );
     }
 
-    this.memoryState = createInitialMaterializedState(channel);
+    const matState = createInitialMaterializedState(channel);
+    this.memoryChannels.set(channelId, matState);
+    this.memoryState = matState;
     return { channel, tasks: [], messages: [] };
   }
 

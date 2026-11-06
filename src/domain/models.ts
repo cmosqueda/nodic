@@ -41,6 +41,13 @@ export interface Channel {
   members: Member[];
 }
 
+export interface ChannelSummary {
+  id: string;
+  name: string;
+  description: string | null;
+  leadDeviceId?: string;
+}
+
 export interface WorkspaceSnapshot {
   channel: Channel | null;
   tasks: Task[];

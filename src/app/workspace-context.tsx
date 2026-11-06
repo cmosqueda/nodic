@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useState, type PropsWithChildren } from 'react';
 import type { MemberRole, TaskPriority, TaskStatus, NodicEvent } from '../../protocol/contracts';
-import type { Message, WorkspaceSnapshot } from '../domain/models';
+import type { ChannelSummary, Message, WorkspaceSnapshot } from '../domain/models';
 import { canChangeTaskStatus } from '../domain/permissions/permissions';
 import { createInvitationPayload, encodeInvitationCode, parseInvitationCode } from '../domain/invitations/invitation-codec';
 import { repository } from '../db/repository';
@@ -30,10 +30,12 @@ interface WorkspaceActions {
   removeMember(deviceId: string): Promise<void>;
   updateDisplayName(name: string): Promise<void>;
   createChannel(name: string, description?: string, broadcastToLAN?: boolean): Promise<void>;
+  switchChannel(channelId: string): Promise<void>;
   leaveChannel(): Promise<void>;
   resetDatabase(): Promise<void>;
   isReady: boolean;
   identity: UserIdentity | null;
+  channels: ChannelSummary[];
 }
 
 type WorkspaceContextValue = WorkspaceSnapshot & WorkspaceActions;
@@ -49,7 +51,17 @@ const emptyWorkspace: WorkspaceSnapshot = {
 export function WorkspaceProvider({ children }: PropsWithChildren) {
   const [workspace, setWorkspace] = useState<WorkspaceSnapshot>(emptyWorkspace);
   const [identity, setIdentity] = useState<UserIdentity | null>(null);
+  const [channels, setChannels] = useState<ChannelSummary[]>([]);
   const [isReady, setIsReady] = useState(false);
+
+  const refreshChannels = async () => {
+    try {
+      const list = await repository.listChannels();
+      setChannels(list);
+    } catch (err) {
+      console.warn('Failed to refresh channels list:', err);
+    }
+  };
 
   useEffect(() => {
     let unmounted = false;
@@ -58,6 +70,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
       try {
         const snapshot = await repository.init();
         const idRecord = await repository.getIdentity();
+        const chanList = await repository.listChannels();
         if (!unmounted) {
           setIdentity({
             deviceId: idRecord.deviceId,
@@ -65,6 +78,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
             shortId: `nodic-${idRecord.deviceId.slice(0, 8)}`,
           });
           setWorkspace(snapshot);
+          setChannels(chanList);
           setIsReady(true);
         }
       } catch (err) {
@@ -115,6 +129,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
     ...workspace,
     identity,
     isReady,
+    channels,
 
     async updateDisplayName(name) {
       const clean = name.trim();
@@ -150,6 +165,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
 
       const snapshot = await repository.createChannel(cleanName, description);
       setWorkspace(snapshot);
+      await refreshChannels();
 
       if (broadcastToLAN && snapshot.channel) {
         const idRecord = await repository.getIdentity();
@@ -170,9 +186,16 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
       }
     },
 
+    async switchChannel(channelId: string) {
+      const snapshot = await repository.switchChannel(channelId);
+      setWorkspace(snapshot);
+      await refreshChannels();
+    },
+
     async leaveChannel() {
       const snapshot = await repository.leaveChannel();
       setWorkspace(snapshot);
+      await refreshChannels();
     },
 
     async resetDatabase() {
@@ -184,6 +207,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         shortId: `nodic-${idRecord.deviceId.slice(0, 8)}`,
       });
       setWorkspace(snapshot);
+      setChannels([]);
     },
 
     async createTask(input) {
@@ -312,6 +336,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
       );
 
       setWorkspace(memberEvent.snapshot);
+      await refreshChannels();
       void nativeSync.publishEvent(memberEvent.event);
       return { success: true, message: 'Joined channel successfully!' };
     },
@@ -365,7 +390,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
       setWorkspace(snapshot);
       void nativeSync.publishEvent(event);
     },
-  }), [workspace, identity, isReady]);
+  }), [workspace, identity, isReady, channels]);
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;
 }

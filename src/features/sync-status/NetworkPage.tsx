@@ -1,39 +1,20 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import {
-  IonButton,
-  IonButtons,
-  IonContent,
-  IonHeader,
-  IonIcon,
-  IonModal,
-  IonPage,
-  IonTitle,
-  IonToolbar,
-} from '@ionic/react';
-import { closeOutline, copyOutline, enterOutline, linkOutline, refreshOutline, trashOutline } from 'ionicons/icons';
+import { IonIcon } from '@ionic/react';
+import { trashOutline, wifiOutline, checkmarkCircleOutline } from 'ionicons/icons';
 import type { SyncStatus } from '../../../protocol/contracts';
 import { nativeSync, type ProbeResult } from '../../services/native-sync';
 import { useWorkspace } from '../../app/workspace-context';
-import { PageHeader } from '../../shared/PageHeader';
+import { ConfirmDialog } from '../../shared/Modal';
 
 export function NetworkPage() {
-  const { channel, identity, updateDisplayName, createChannel, joinChannelWithCode, leaveChannel, resetDatabase } = useWorkspace();
+  const { channel, identity, updateDisplayName, leaveChannel, resetDatabase } = useWorkspace();
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [probe, setProbe] = useState<ProbeResult | null>(null);
 
   // Username edit state
   const [usernameInput, setUsernameInput] = useState('');
   const [savedNameNotice, setSavedNameNotice] = useState(false);
-
-  // Channel creation state
-  const [showCreateModal, setShowCreateModal] = useState(false);
-  const [newChannelName, setNewChannelName] = useState('');
-  const [newChannelDesc, setNewChannelDesc] = useState('');
-
-  // Join channel state
-  const [showJoinModal, setShowJoinModal] = useState(false);
-  const [joinCodeInput, setJoinCodeInput] = useState('');
-  const [joinStatus, setJoinStatus] = useState<string | null>(null);
+  const [showResetAlert, setShowResetAlert] = useState(false);
 
   useEffect(() => {
     if (identity?.displayName) {
@@ -45,7 +26,9 @@ export function NetworkPage() {
     void nativeSync.getStatus().then(setStatus);
     if (!nativeSync.isNative()) return;
     const listener = nativeSync.plugin.addListener('statusChanged', setStatus);
-    return () => { void listener.then((handle) => handle.remove()); };
+    return () => {
+      void listener.then((handle) => handle.remove());
+    };
   }, []);
 
   async function handleSaveUsername(e: FormEvent) {
@@ -54,32 +37,6 @@ export function NetworkPage() {
     await updateDisplayName(usernameInput.trim());
     setSavedNameNotice(true);
     setTimeout(() => setSavedNameNotice(false), 2500);
-  }
-
-  async function handleCreateChannel(e: FormEvent) {
-    e.preventDefault();
-    if (!newChannelName.trim()) return;
-    await createChannel(newChannelName.trim(), newChannelDesc.trim() || undefined, true);
-    setNewChannelName('');
-    setNewChannelDesc('');
-    setShowCreateModal(false);
-  }
-
-  async function handleJoinChannel(e: FormEvent) {
-    e.preventDefault();
-    if (!joinCodeInput.trim()) return;
-    setJoinStatus('Joining channel...');
-    const result = await joinChannelWithCode(joinCodeInput.trim(), usernameInput.trim() || undefined);
-    if (result.success) {
-      setJoinStatus('Success!');
-      setTimeout(() => {
-        setShowJoinModal(false);
-        setJoinCodeInput('');
-        setJoinStatus(null);
-      }, 1000);
-    } else {
-      setJoinStatus(`Error: ${result.message}`);
-    }
   }
 
   async function startNetwork() {
@@ -93,216 +50,190 @@ export function NetworkPage() {
       databaseReady: current?.databaseReady ?? false,
       serviceReady: status?.state !== 'STOPPED',
       deviceId: current?.deviceId ?? identity?.deviceId ?? 'pending',
-      details: [...(current?.details ?? []), result.accepted ? `Probe ${result.probeId.slice(0, 8)} queued.` : 'No discovered peer accepted the probe.'],
+      details: [
+        ...(current?.details ?? []),
+        result.accepted
+          ? `Probe ${result.probeId.slice(0, 8)} broadcasted.`
+          : 'No discovered peer accepted the probe.',
+      ],
     }));
     setStatus(await nativeSync.getStatus());
   }
 
   return (
-    <IonPage>
-      <IonContent fullscreen>
-        <div className="page-wrap narrow-page">
-          <PageHeader
-            eyebrow="Device & Network Hub"
-            title="Local Configuration"
-            detail="Configure your username, manage channel membership, and discover nearby peers on Wi-Fi."
-          />
+    <div className="screen-container">
+      <div className="page-wrap narrow-page">
+        {/* Header Chip matching wireframe prototype */}
+        <div className="channel-header-chip">
+          <div>
+            <strong>Network Configuration</strong>
+            <small>Device & Diagnostic Hub</small>
+          </div>
+          <IonIcon icon={wifiOutline} style={{ fontSize: '20px', color: 'var(--nodic-signal)' }} />
+        </div>
 
-          {/* Device Identity & Username Configuration Card */}
-          <section className="network-card" style={{ marginBottom: '18px', gridTemplateColumns: '1fr' }}>
-            <div style={{ display: 'grid', gap: '12px' }}>
-              <span className="eyebrow">Device Identity Configuration</span>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
-                <div>
-                  <small style={{ color: 'var(--nodic-muted)', display: 'block', textTransform: 'uppercase', fontSize: '10px' }}>Unique Nodic Identifier</small>
-                  <strong style={{ fontSize: '15px', fontFamily: 'monospace' }}>{identity?.shortId ?? 'Generating...'}</strong>
-                </div>
-                <div style={{ fontSize: '11px', color: 'var(--nodic-muted)' }}>
-                  ID: {identity?.deviceId.slice(0, 18)}...
-                </div>
+        <div className="network-hub-grid">
+          {/* Card 1: Device Configuration & Username */}
+          <div className="hub-card">
+            <h3>Device Configuration</h3>
+            <p>Configure how this node identifies on the peer-to-peer Wi-Fi LAN.</p>
+
+            <div style={{ display: 'grid', gap: '10px', marginBottom: '14px' }}>
+              <div>
+                <small style={{ color: 'var(--nodic-muted)', display: 'block', fontSize: '11px', textTransform: 'uppercase', marginBottom: '3px' }}>
+                  Nodic Identifier
+                </small>
+                <strong style={{ fontFamily: 'monospace', fontSize: '14px', background: '#f0f4f5', padding: '4px 10px', borderRadius: '6px', border: '1px solid var(--nodic-line)' }}>
+                  {identity?.shortId ?? 'nodic-node'}
+                </strong>
               </div>
 
-              <form onSubmit={(e) => void handleSaveUsername(e)} style={{ display: 'flex', gap: '10px', alignItems: 'flex-end', marginTop: '6px' }}>
+              <form onSubmit={(e) => void handleSaveUsername(e)} style={{ display: 'flex', gap: '8px', alignItems: 'flex-end', marginTop: '6px' }}>
                 <div style={{ flex: 1 }}>
-                  <label htmlFor="username-cfg" style={{ display: 'block', marginBottom: '4px', fontSize: '12px', fontWeight: 600 }}>
-                    Username (Display Name)
+                  <label htmlFor="username-input" style={{ display: 'block', fontSize: '12px', fontWeight: 600, marginBottom: '4px' }}>
+                    Username
                   </label>
                   <input
-                    id="username-cfg"
+                    id="username-input"
                     type="text"
                     required
                     value={usernameInput}
                     onChange={(e) => setUsernameInput(e.target.value)}
                     placeholder="e.g. Rocket Puncher"
-                    style={{ width: '100%', padding: '10px 14px', borderRadius: '8px', border: '1px solid var(--nodic-line)', background: 'white' }}
+                    style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid var(--nodic-line)', background: 'white' }}
                   />
                 </div>
-                <IonButton type="submit" disabled={!usernameInput.trim() || usernameInput === identity?.displayName}>
+                <button
+                  type="submit"
+                  className="dialog-btn-primary"
+                  style={{ padding: '9px 16px' }}
+                  disabled={!usernameInput.trim() || usernameInput === identity?.displayName}
+                >
                   Save Name
-                </IonButton>
+                </button>
               </form>
-              {savedNameNotice && <span style={{ color: '#167a92', fontSize: '12px', fontWeight: 600 }}>Username updated across local network!</span>}
-            </div>
-          </section>
 
-          {/* Channel / Workspace Management Card */}
-          <section className="network-card" style={{ marginBottom: '18px', gridTemplateColumns: '1fr' }}>
-            <div style={{ display: 'grid', gap: '12px' }}>
-              <span className="eyebrow">Channel / Workspace</span>
-              {channel ? (
-                <div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
-                    <div>
-                      <h3 style={{ margin: '0 0 4px', fontSize: '20px' }}>{channel.name}</h3>
-                      <p style={{ margin: 0, color: 'var(--nodic-muted)', fontSize: '12px' }}>{channel.description || 'Department channel'}</p>
-                    </div>
-                    <span style={{ padding: '4px 10px', borderRadius: '12px', background: 'rgba(105, 196, 200, 0.15)', color: 'var(--nodic-signal)', fontSize: '12px', fontWeight: 700 }}>
-                      {channel.members.find((m) => m.deviceId === identity?.deviceId)?.role === 'LEAD' ? 'Team Lead' : 'Member'}
-                    </span>
-                  </div>
-
-                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '12px' }}>
-                    <IonButton fill="outline" color="medium" size="small" onClick={() => void leaveChannel()}>
-                      Leave Channel
-                    </IonButton>
-                    <IonButton fill="outline" color="danger" size="small" onClick={() => void resetDatabase()}>
-                      <IonIcon slot="start" icon={trashOutline} />
-                      Clean Slate (Reset Data)
-                    </IonButton>
-                  </div>
-                </div>
-              ) : (
-                <div>
-                  <p style={{ color: 'var(--nodic-muted)', margin: '0 0 14px' }}>
-                    You are not currently in a channel. As Team Lead, create a new channel and broadcast it on the local network, or join a channel using an invite code.
-                  </p>
-                  <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-                    <IonButton className="primary-action" onClick={() => setShowCreateModal(true)}>
-                      <IonIcon slot="start" icon={linkOutline} />
-                      Create Channel (Team Lead)
-                    </IonButton>
-                    <IonButton fill="outline" onClick={() => setShowJoinModal(true)}>
-                      <IonIcon slot="start" icon={enterOutline} />
-                      Join with Code
-                    </IonButton>
-                  </div>
+              {savedNameNotice && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#16a34a', fontSize: '12px', fontWeight: 600 }}>
+                  <IonIcon icon={checkmarkCircleOutline} />
+                  <span>Username saved!</span>
                 </div>
               )}
             </div>
-          </section>
+          </div>
 
-          {/* Wi-Fi & LAN Diagnostics */}
-          <section className="network-card">
-            <div className={`network-orb state-${status?.state.toLowerCase() ?? 'stopped'}`}><span /></div>
-            <div>
-              <span className="eyebrow">Local Wi-Fi Mesh</span>
-              <h2>{status?.state.toLowerCase() ?? 'checking'}</h2>
-              <p>{status?.detail ?? 'Reading native service status…'}</p>
+          {/* Card 2: Local Wi-Fi Mesh Network Diagnostics */}
+          <div className="hub-card">
+            <h3>Local Wi-Fi Mesh Network</h3>
+            <p>Direct peer communication operates over local subnet broadcasting without internet servers.</p>
+
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '10px', marginBottom: '10px' }}>
+              <div style={{ padding: '10px', background: '#f8fafb', borderRadius: '8px', border: '1px solid var(--nodic-line)' }}>
+                <small style={{ color: 'var(--nodic-muted)', fontSize: '10px', display: 'block', textTransform: 'uppercase' }}>Subnet / Port</small>
+                <strong style={{ fontSize: '13px' }}>192.168.x.x:8443</strong>
+              </div>
+
+              <div style={{ padding: '10px', background: '#f8fafb', borderRadius: '8px', border: '1px solid var(--nodic-line)' }}>
+                <small style={{ color: 'var(--nodic-muted)', fontSize: '10px', display: 'block', textTransform: 'uppercase' }}>Nearby Peers</small>
+                <strong style={{ fontSize: '13px', color: status?.peerCount ? '#16a34a' : 'inherit' }}>
+                  {status?.peerCount ?? 0} Discovered
+                </strong>
+              </div>
+
+              <div style={{ padding: '10px', background: '#f8fafb', borderRadius: '8px', border: '1px solid var(--nodic-line)' }}>
+                <small style={{ color: 'var(--nodic-muted)', fontSize: '10px', display: 'block', textTransform: 'uppercase' }}>Service Status</small>
+                <strong style={{ fontSize: '13px', color: status?.state === 'CONNECTED' ? '#16a34a' : 'inherit' }}>
+                  {status?.state ?? 'STANDBY'}
+                </strong>
+              </div>
             </div>
-            <dl>
-              <div><dt>Nearby peers</dt><dd>{status?.peerCount ?? '—'}</dd></div>
-              <div><dt>Pending events</dt><dd>{status?.pendingEventCount ?? '—'}</dd></div>
-              <div><dt>Runtime</dt><dd>{nativeSync.isNative() ? 'Android' : 'Browser preview'}</dd></div>
-            </dl>
-          </section>
+          </div>
 
-          <section className="probe-card">
-            <div>
-              <h2>Foreground Service Probe</h2>
-              <p>Check the native discovery socket and SQLite background sync.</p>
+          {/* Card 3: Foreground Service & Probe Testing */}
+          <div className="hub-card">
+            <h3>Service Diagnostics & Probes</h3>
+            <p>Test background peer discovery socket and probe exchange.</p>
+
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '10px' }}>
+              <button
+                className="dialog-btn-outline"
+                onClick={() => void nativeSync.runProbe().then(setProbe)}
+              >
+                Check Native Socket
+              </button>
+              {status?.state === 'STOPPED' && (
+                <button className="dialog-btn-primary" onClick={() => void startNetwork()}>
+                  Start Network
+                </button>
+              )}
+              <button className="dialog-btn-primary" onClick={() => void sendProbe()}>
+                Send Probe
+              </button>
             </div>
-            <div className="probe-actions">
-              <IonButton fill="outline" onClick={() => void nativeSync.runProbe().then(setProbe)}>Check native</IonButton>
-              {status?.state === 'STOPPED' && <IonButton onClick={() => void startNetwork()}>Start network</IonButton>}
-              {status?.state !== 'STOPPED' && <IonButton onClick={() => void sendProbe()}>Send probe</IonButton>}
-            </div>
-            {probe && <ul>{probe.details.map((detail) => <li key={detail}>{detail}</li>)}</ul>}
-          </section>
 
-          {/* Create Channel Modal */}
-          <IonModal isOpen={showCreateModal} onDidDismiss={() => setShowCreateModal(false)}>
-            <IonHeader>
-              <IonToolbar>
-                <IonTitle>Create Work Channel</IonTitle>
-                <IonButtons slot="end">
-                  <IonButton onClick={() => setShowCreateModal(false)}><IonIcon icon={closeOutline} /></IonButton>
-                </IonButtons>
-              </IonToolbar>
-            </IonHeader>
-            <IonContent className="ion-padding">
-              <form onSubmit={(e) => void handleCreateChannel(e)} style={{ maxWidth: '440px', margin: '0 auto', display: 'grid', gap: '14px', paddingTop: '14px' }}>
-                <p style={{ color: 'var(--nodic-muted)' }}>
-                  You will become the Team Lead for this channel and can invite members or appoint co-leads.
-                </p>
-                <div>
-                  <label style={{ display: 'block', marginBottom: '6px', fontWeight: 600 }}>Channel Name *</label>
-                  <input
-                    type="text"
-                    required
-                    value={newChannelName}
-                    onChange={(e) => setNewChannelName(e.target.value)}
-                    placeholder="e.g. Operations Alpha"
-                    style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid var(--nodic-line)', background: 'white' }}
-                  />
-                </div>
-                <div>
-                  <label style={{ display: 'block', marginBottom: '6px', fontWeight: 600 }}>Description</label>
-                  <textarea
-                    rows={2}
-                    value={newChannelDesc}
-                    onChange={(e) => setNewChannelDesc(e.target.value)}
-                    placeholder="Brief channel purpose..."
-                    style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid var(--nodic-line)', background: 'white' }}
-                  />
-                </div>
-                <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', marginTop: '10px' }}>
-                  <IonButton fill="outline" onClick={() => setShowCreateModal(false)}>Cancel</IonButton>
-                  <IonButton type="submit" disabled={!newChannelName.trim()}>Create & Broadcast</IonButton>
-                </div>
-              </form>
-            </IonContent>
-          </IonModal>
+            {probe && probe.details.length > 0 && (
+              <div style={{ background: '#f0f4f5', padding: '10px 14px', borderRadius: '8px', fontSize: '11px', fontFamily: 'monospace' }}>
+                {probe.details.map((d, i) => (
+                  <div key={i}>• {d}</div>
+                ))}
+              </div>
+            )}
+          </div>
 
-          {/* Join Channel Modal */}
-          <IonModal isOpen={showJoinModal} onDidDismiss={() => setShowJoinModal(false)}>
-            <IonHeader>
-              <IonToolbar>
-                <IonTitle>Join Channel via Code</IonTitle>
-                <IonButtons slot="end">
-                  <IonButton onClick={() => setShowJoinModal(false)}><IonIcon icon={closeOutline} /></IonButton>
-                </IonButtons>
-              </IonToolbar>
-            </IonHeader>
-            <IonContent className="ion-padding">
-              <form onSubmit={(e) => void handleJoinChannel(e)} style={{ maxWidth: '440px', margin: '0 auto', display: 'grid', gap: '14px', paddingTop: '14px' }}>
-                <p style={{ color: 'var(--nodic-muted)' }}>
-                  Paste the invitation code generated by your Team Lead.
-                </p>
-                <div>
-                  <label style={{ display: 'block', marginBottom: '6px', fontWeight: 600 }}>Invitation Code *</label>
-                  <textarea
-                    rows={3}
-                    required
-                    value={joinCodeInput}
-                    onChange={(e) => setJoinCodeInput(e.target.value)}
-                    placeholder="nodic:v1:..."
-                    style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid var(--nodic-line)', background: 'white', fontFamily: 'monospace', fontSize: '12px' }}
-                  />
-                </div>
-                {joinStatus && (
-                  <div style={{ padding: '10px', borderRadius: '8px', background: joinStatus.startsWith('Error') ? '#ffeef0' : '#eaf8f4', color: joinStatus.startsWith('Error') ? '#b3261e' : '#146c54', fontSize: '13px' }}>
-                    {joinStatus}
+          {/* Card 4: Channel & Data Management */}
+          <div className="hub-card">
+            <h3>Channel & Database Management</h3>
+            <p>Manage current channel state or reset the database on this node.</p>
+
+            {channel ? (
+              <div style={{ marginBottom: '14px', padding: '10px', background: '#f8fafb', borderRadius: '8px', border: '1px solid var(--nodic-line)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div>
+                    <strong>{channel.name}</strong>
+                    <small style={{ display: 'block', color: 'var(--nodic-muted)', fontSize: '11px' }}>
+                      ID: {channel.id.slice(0, 12)}...
+                    </small>
                   </div>
-                )}
-                <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', marginTop: '10px' }}>
-                  <IonButton fill="outline" onClick={() => setShowJoinModal(false)}>Cancel</IonButton>
-                  <IonButton type="submit" disabled={!joinCodeInput.trim()}>Join Channel</IonButton>
+                  <button className="dialog-btn-outline" onClick={() => void leaveChannel()}>
+                    Leave Channel
+                  </button>
                 </div>
-              </form>
-            </IonContent>
-          </IonModal>
+              </div>
+            ) : (
+              <p style={{ color: 'var(--nodic-muted)', fontSize: '12px' }}>
+                No active channel currently loaded. Create or switch channels from the top-left drawer menu.
+              </p>
+            )}
+
+            <div style={{ borderTop: '1px dashed #cbdfe3', paddingTop: '12px', marginTop: '12px' }}>
+              <small style={{ color: '#b3261e', display: 'block', fontWeight: 700, marginBottom: '6px', fontSize: '11px', textTransform: 'uppercase' }}>
+                Danger Zone
+              </small>
+              <button
+                className="dialog-btn-danger"
+                onClick={() => setShowResetAlert(true)}
+              >
+                <IonIcon icon={trashOutline} style={{ marginRight: '6px', verticalAlign: 'middle' }} />
+                Reset Database (Clean Slate)
+              </button>
+            </div>
+          </div>
         </div>
-      </IonContent>
-    </IonPage>
+
+        {/* Pure React Reset Confirmation Alert */}
+        <ConfirmDialog
+          isOpen={showResetAlert}
+          title="Reset Local Database"
+          message="Are you sure you want to erase all local channels, tasks, and messages? This action cannot be undone."
+          confirmText="Erase Everything"
+          confirmDestructive
+          onConfirm={() => {
+            void resetDatabase();
+            setShowResetAlert(false);
+          }}
+          onCancel={() => setShowResetAlert(false)}
+        />
+      </div>
+    </div>
   );
 }
