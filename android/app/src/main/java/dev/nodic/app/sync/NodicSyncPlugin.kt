@@ -3,23 +3,28 @@ package dev.nodic.app.sync
 import android.Manifest
 import android.content.Intent
 import android.os.Build
+import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
+import com.getcapacitor.PermissionState
 import com.getcapacitor.Plugin
 import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
-import com.getcapacitor.PermissionState
 import com.getcapacitor.annotation.CapacitorPlugin
 import com.getcapacitor.annotation.Permission
 import com.getcapacitor.annotation.PermissionCallback
+import org.json.JSONArray
+import org.json.JSONObject
 import java.lang.ref.WeakReference
-import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.Executors
 
 @CapacitorPlugin(
     name = "NodicSync",
     permissions = [Permission(alias = "notifications", strings = [Manifest.permission.POST_NOTIFICATIONS])],
 )
 class NodicSyncPlugin : Plugin() {
+    private val pluginExecutor = Executors.newSingleThreadExecutor()
+
     override fun load() {
         instance = WeakReference(this)
     }
@@ -42,10 +47,21 @@ class NodicSyncPlugin : Plugin() {
     }
 
     private fun startService(call: PluginCall) {
-        val displayName = call.getString("displayName")?.take(80) ?: "Nodic member"
+        val displayName = call.getString("displayName")?.take(80)
+        val deviceId = call.getString("deviceId")?.take(128)
+        val publicKey = call.getString("publicKey")?.take(2048)
+        val identity = PhaseZeroStore(context).use { store ->
+            if (!displayName.isNullOrBlank() || !deviceId.isNullOrBlank()) {
+                store.updateLocalIdentity(deviceId, displayName ?: "Nodic member", publicKey)
+            } else {
+                store.getOrCreateLocalIdentity()
+            }
+        }
         val intent = Intent(context, NodicSyncService::class.java).apply {
             action = NodicSyncService.ACTION_START
-            putExtra(NodicSyncService.EXTRA_DISPLAY_NAME, displayName)
+            putExtra(NodicSyncService.EXTRA_DISPLAY_NAME, identity.displayName)
+            putExtra(NodicSyncService.EXTRA_DEVICE_ID, identity.deviceId)
+            putExtra(NodicSyncService.EXTRA_PUBLIC_KEY, identity.publicKey)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent) else context.startService(intent)
         call.resolve(stateToJs(NodicSyncService.currentState.copy(state = "SEARCHING", detail = "Starting local discovery")))
@@ -90,20 +106,80 @@ class NodicSyncPlugin : Plugin() {
 
     @PluginMethod
     fun getDeviceIdentity(call: PluginCall) {
-        val preferences = context.getSharedPreferences("nodic_identity", 0)
-        val existing = preferences.getString("device_id", null)
-        val deviceId = existing ?: UUID.randomUUID().toString().also {
-            preferences.edit().putString("device_id", it).apply()
+        val preferredName = call.getString("displayName")
+        val identity = PhaseZeroStore(context).use { it.getOrCreateLocalIdentity(preferredName) }
+        call.resolve(
+            JSObject()
+                .put("deviceId", identity.deviceId)
+                .put("displayName", identity.displayName)
+                .put("publicKey", identity.publicKey)
+                .put("keystoreAlias", identity.keystoreAlias),
+        )
+    }
+
+    @PluginMethod
+    fun syncDeviceIdentity(call: PluginCall) {
+        val deviceId = call.getString("deviceId")
+        val displayName = call.getString("displayName") ?: "Nodic member"
+        val publicKey = call.getString("publicKey")
+        val updated = PhaseZeroStore(context).use {
+            it.updateLocalIdentity(deviceId, displayName, publicKey)
         }
-        call.resolve(JSObject().put("deviceId", deviceId).put("publicKey", "phase-0-key-not-generated"))
+        NodicSyncService.notifyIdentityUpdated()
+        call.resolve(
+            JSObject()
+                .put("deviceId", updated.deviceId)
+                .put("displayName", updated.displayName)
+                .put("publicKey", updated.publicKey)
+                .put("keystoreAlias", updated.keystoreAlias),
+        )
+    }
+
+    @PluginMethod
+    fun connectPeer(call: PluginCall) {
+        val host = call.getString("host")?.trim()
+        val port = call.getInt("port") ?: 0
+        if (host.isNullOrBlank() || port <= 0) {
+            call.reject("Valid host and port are required", "INVALID_ENDPOINT")
+            return
+        }
+        pluginExecutor.execute {
+            val connected = NodicSyncService.connectToPeer(host, port)
+            call.resolve(JSObject().put("connected", connected).put("host", host).put("port", port))
+        }
+    }
+
+    @PluginMethod
+    fun getDiagnostics(call: PluginCall) {
+        PhaseZeroStore(context).use { store ->
+            val peers = jsonArrayToJsArray(store.getPeerIdentities())
+            val sessions = jsonArrayToJsArray(store.getPeerSessions(50))
+            val logs = jsonArrayToJsArray(store.getSyncLogs(100))
+            call.resolve(
+                JSObject()
+                    .put("peerIdentities", peers)
+                    .put("peerSessions", sessions)
+                    .put("syncLogs", logs),
+            )
+        }
+    }
+
+    @PluginMethod
+    fun clearLogs(call: PluginCall) {
+        PhaseZeroStore(context).use { it.clearSyncLogs() }
+        call.resolve(JSObject().put("cleared", true))
     }
 
     @PluginMethod
     fun runProbe(call: PluginCall) {
-        val details = com.getcapacitor.JSArray()
+        val details = JSArray()
         var databaseReady = false
+        var identity: LocalNodeIdentity? = null
         try {
-            databaseReady = PhaseZeroStore(context).use { it.verify() }
+            PhaseZeroStore(context).use { store ->
+                databaseReady = store.verify()
+                identity = store.getOrCreateLocalIdentity()
+            }
             details.put("Native SQLite opened and accepted a query.")
         } catch (error: Exception) {
             details.put("SQLite failed: ${error.message}")
@@ -111,11 +187,11 @@ class NodicSyncPlugin : Plugin() {
         val serviceReady = NodicSyncService.currentState.state != "STOPPED"
         details.put(if (serviceReady) "Foreground sync service is active." else "Start networking to activate the foreground service.")
         details.put("Discovered peers: ${NodicSyncService.currentState.peerCount}.")
-
-        val preferences = context.getSharedPreferences("nodic_identity", 0)
-        val deviceId = preferences.getString("device_id", null) ?: UUID.randomUUID().toString().also {
-            preferences.edit().putString("device_id", it).apply()
+        if (NodicSyncService.currentState.localEndpoint != null) {
+            details.put("Listening endpoint: ${NodicSyncService.currentState.localEndpoint}")
         }
+
+        val deviceId = identity?.deviceId ?: UUID.randomUUID().toString()
         call.resolve(
             JSObject()
                 .put("pluginReady", true)
@@ -124,6 +200,17 @@ class NodicSyncPlugin : Plugin() {
                 .put("deviceId", deviceId)
                 .put("details", details),
         )
+    }
+
+    private fun jsonArrayToJsArray(arr: JSONArray): JSArray {
+        val jsArr = JSArray()
+        for (i in 0 until arr.length()) {
+            val item = arr.optJSONObject(i)
+            if (item != null) {
+                jsArr.put(JSObject.fromJSONObject(item))
+            }
+        }
+        return jsArr
     }
 
     private fun emit(name: String, payload: JSObject) = notifyListeners(name, payload)
@@ -141,11 +228,30 @@ class NodicSyncPlugin : Plugin() {
             }
         }
 
+        fun emitPeerIdentity(peerJson: JSONObject) {
+            try {
+                instance.get()?.emit("peerIdentityUpdated", JSObject.fromJSONObject(peerJson))
+            } catch (_: Exception) {}
+        }
+
+        fun emitPeerSession(sessionJson: JSONObject) {
+            try {
+                instance.get()?.emit("peerSessionUpdated", JSObject.fromJSONObject(sessionJson))
+            } catch (_: Exception) {}
+        }
+
+        fun emitLogAdded(logJson: JSONObject) {
+            try {
+                instance.get()?.emit("syncLogAdded", JSObject.fromJSONObject(logJson))
+            } catch (_: Exception) {}
+        }
+
         private fun stateToJs(state: SyncState) = JSObject()
             .put("state", state.state)
             .put("peerCount", state.peerCount)
             .put("pendingEventCount", state.pendingEventCount)
             .put("lastSyncAt", state.lastSyncAt)
             .put("detail", state.detail)
+            .put("localEndpoint", state.localEndpoint)
     }
 }

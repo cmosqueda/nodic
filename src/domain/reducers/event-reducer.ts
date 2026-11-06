@@ -44,20 +44,25 @@ export function applyEventToState(
 
   switch (event.type) {
     case 'CHANNEL_CREATED': {
-      const payload = event.payload as { name?: string; description?: string };
+      const payload = event.payload as {
+        name?: string;
+        description?: string;
+        leadDisplayName?: string;
+      };
       state.channel.name = payload.name ?? state.channel.name;
       state.channel.description = payload.description ?? null;
-      if (!state.members.has(event.authorDeviceId)) {
-        const lead: Member = {
-          deviceId: event.authorDeviceId,
-          displayName: authorName,
-          role: 'LEAD',
-          presence: 'ONLINE',
-          initials: authorName.slice(0, 2).toUpperCase(),
-        };
-        state.members.set(lead.deviceId, lead);
-        result.updatedMembers.push(lead);
-      }
+      state.channel.leadDeviceId = event.authorDeviceId;
+      const effectiveLeadName = payload.leadDisplayName ?? author?.displayName ?? event.authorDeviceId.slice(0, 8);
+      const lead: Member = {
+        deviceId: event.authorDeviceId,
+        displayName: effectiveLeadName,
+        role: 'LEAD',
+        presence: 'ONLINE',
+        initials: effectiveLeadName.slice(0, 2).toUpperCase(),
+      };
+      state.members.set(lead.deviceId, lead);
+      state.channel.members = Array.from(state.members.values());
+      result.updatedMembers.push(lead);
       break;
     }
 
@@ -67,14 +72,16 @@ export function applyEventToState(
         displayName: string;
         role?: MemberRole;
       };
+      const existing = state.members.get(payload.deviceId);
       const member: Member = {
         deviceId: payload.deviceId,
         displayName: payload.displayName,
-        role: payload.role ?? 'MEMBER',
-        presence: 'RECENT',
+        role: payload.role ?? existing?.role ?? 'MEMBER',
+        presence: existing?.presence ?? 'ONLINE',
         initials: payload.displayName.slice(0, 2).toUpperCase(),
       };
       state.members.set(member.deviceId, member);
+      state.channel.members = Array.from(state.members.values());
       result.updatedMembers.push(member);
       break;
     }
@@ -84,6 +91,7 @@ export function applyEventToState(
       const existing = state.members.get(payload.deviceId);
       if (existing) {
         existing.role = payload.role;
+        state.channel.members = Array.from(state.members.values());
         result.updatedMembers.push(existing);
       }
       break;
@@ -95,6 +103,7 @@ export function applyEventToState(
       if (existing) {
         existing.presence = 'OFFLINE';
         state.members.delete(payload.deviceId);
+        state.channel.members = Array.from(state.members.values());
         result.updatedMembers.push(existing);
       }
       break;

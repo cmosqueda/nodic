@@ -128,3 +128,60 @@ export const rejectedEvents = sqliteTable('rejected_events', {
   reasonCode: text('reason_code').notNull(),
   receivedAt: integer('received_at').notNull(),
 });
+
+export const peerIdentities = sqliteTable(
+  'peer_identities',
+  {
+    deviceId: text('device_id').primaryKey(),
+    displayName: text('display_name').notNull(),
+    publicSigningKey: text('public_signing_key').notNull(),
+    serviceName: text('service_name'),
+    host: text('host').notNull(),
+    port: integer('port').notNull(),
+    status: text('status').$type<'ONLINE' | 'OFFLINE' | 'STALE'>().notNull().default('ONLINE'),
+    firstSeenAt: integer('first_seen_at').notNull(),
+    lastSeenAt: integer('last_seen_at').notNull(),
+  },
+  (table) => [index('peer_identities_status_idx').on(table.status, table.lastSeenAt)],
+);
+
+export const peerSessions = sqliteTable(
+  'peer_sessions',
+  {
+    id: text('id').primaryKey(),
+    peerDeviceId: text('peer_device_id').notNull(),
+    peerDisplayName: text('peer_display_name').notNull(),
+    peerPublicKey: text('peer_public_key').notNull(),
+    peerAddress: text('peer_address').notNull(),
+    peerPort: integer('peer_port').notNull(),
+    direction: text('direction').$type<'INBOUND' | 'OUTBOUND'>().notNull(),
+    status: text('status').$type<'CONNECTING' | 'CONNECTED' | 'DISCONNECTED' | 'ERROR'>().notNull(),
+    startedAt: integer('started_at').notNull(),
+    lastActivityAt: integer('last_activity_at').notNull(),
+    endedAt: integer('ended_at'),
+    eventsSent: integer('events_sent').notNull().default(0),
+    eventsReceived: integer('events_received').notNull().default(0),
+  },
+  (table) => [
+    index('peer_sessions_peer_idx').on(table.peerDeviceId, table.startedAt),
+    index('peer_sessions_status_idx').on(table.status, table.lastActivityAt),
+  ],
+);
+
+export const syncLogs = sqliteTable(
+  'sync_logs',
+  {
+    id: text('id').primaryKey(),
+    level: text('level').$type<'INFO' | 'WARN' | 'ERROR'>().notNull(),
+    category: text('category').$type<'IDENTITY' | 'DISCOVERY' | 'HANDSHAKE' | 'SESSION' | 'SYNC' | 'EVENT'>().notNull(),
+    peerDeviceId: text('peer_device_id'),
+    sessionId: text('session_id'),
+    message: text('message').notNull(),
+    detailsJson: text('details_json'),
+    createdAt: integer('created_at').notNull(),
+  },
+  (table) => [
+    index('sync_logs_created_idx').on(table.createdAt),
+    index('sync_logs_peer_idx').on(table.peerDeviceId, table.createdAt),
+  ],
+);

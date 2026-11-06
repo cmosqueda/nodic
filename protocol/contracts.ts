@@ -62,8 +62,68 @@ export const syncSummarySchema = z.object({
 });
 export type SyncSummary = z.infer<typeof syncSummarySchema>;
 
+export const peerIdentitySchema = z.object({
+  deviceId: z.string().min(1).max(128),
+  displayName: z.string().min(1).max(80),
+  publicSigningKey: z.string().min(1).max(2048),
+  serviceName: z.string().max(128).nullable(),
+  host: z.string().min(1).max(256),
+  port: z.number().int().positive(),
+  status: z.enum(['ONLINE', 'OFFLINE', 'STALE']),
+  firstSeenAt: z.string(),
+  lastSeenAt: z.string(),
+});
+export type PeerIdentity = z.infer<typeof peerIdentitySchema>;
+
+export const peerSessionSchema = z.object({
+  id: z.string().min(1).max(128),
+  peerDeviceId: z.string().min(1).max(128),
+  peerDisplayName: z.string().min(1).max(80),
+  peerPublicKey: z.string().min(1).max(2048),
+  peerAddress: z.string().min(1).max(256),
+  peerPort: z.number().int().positive(),
+  direction: z.enum(['INBOUND', 'OUTBOUND']),
+  status: z.enum(['CONNECTING', 'CONNECTED', 'DISCONNECTED', 'ERROR']),
+  startedAt: z.string(),
+  lastActivityAt: z.string(),
+  endedAt: z.string().nullable(),
+  eventsSent: z.number().int().nonnegative(),
+  eventsReceived: z.number().int().nonnegative(),
+});
+export type PeerSession = z.infer<typeof peerSessionSchema>;
+
+export const syncLogSchema = z.object({
+  id: z.string().min(1).max(128),
+  level: z.enum(['INFO', 'WARN', 'ERROR']),
+  category: z.enum(['IDENTITY', 'DISCOVERY', 'HANDSHAKE', 'SESSION', 'SYNC', 'EVENT']),
+  peerDeviceId: z.string().nullable(),
+  sessionId: z.string().nullable(),
+  message: z.string().min(1).max(1024),
+  detailsJson: z.string().nullable(),
+  createdAt: z.string(),
+});
+export type SyncLog = z.infer<typeof syncLogSchema>;
+
 export const peerFrameSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('HELLO'), protocolVersion: z.literal(1), instanceId: z.string() }),
+  z.object({
+    kind: z.literal('HELLO'),
+    protocolVersion: z.literal(1),
+    instanceId: z.string(),
+    sessionId: z.string().optional(),
+    deviceId: z.string().optional(),
+    displayName: z.string().optional(),
+    publicKey: z.string().optional(),
+    listenPort: z.number().int().positive().optional(),
+  }),
+  z.object({
+    kind: z.literal('HELLO_ACK'),
+    protocolVersion: z.literal(1),
+    sessionId: z.string(),
+    deviceId: z.string(),
+    displayName: z.string(),
+    publicKey: z.string(),
+    listenPort: z.number().int().positive(),
+  }),
   z.object({ kind: z.literal('SUMMARY'), requestId: z.string(), summary: syncSummarySchema }),
   z.object({ kind: z.literal('EVENT_BATCH'), requestId: z.string(), events: z.array(nodicEventSchema).max(100) }),
   z.object({ kind: z.literal('ACK'), requestId: z.string(), summary: syncSummarySchema }),
@@ -77,5 +137,6 @@ export const syncStatusSchema = z.object({
   pendingEventCount: z.number().int().nonnegative(),
   lastSyncAt: z.string().nullable(),
   detail: z.string().nullable(),
+  localEndpoint: z.string().nullable().optional(),
 });
 export type SyncStatus = z.infer<typeof syncStatusSchema>;

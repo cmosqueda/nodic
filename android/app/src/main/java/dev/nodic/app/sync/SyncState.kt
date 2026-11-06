@@ -6,4 +6,5 @@ data class SyncState(
     val pendingEventCount: Int = 0,
     val lastSyncAt: String? = null,
     val detail: String? = null,
+    val localEndpoint: String? = null,
 )

@@ -1,5 +1,5 @@
 import { Capacitor, registerPlugin, type PluginListenerHandle } from '@capacitor/core';
-import type { NodicEvent, SyncStatus } from '../../protocol/contracts';
+import type { NodicEvent, PeerIdentity, PeerSession, SyncLog, SyncStatus } from '../../protocol/contracts';
 
 export interface ProbeResult {
   pluginReady: boolean;
@@ -9,13 +9,34 @@ export interface ProbeResult {
   details: string[];
 }
 
+export interface NativeDiagnosticsSnapshot {
+  peerIdentities: PeerIdentity[];
+  peerSessions: PeerSession[];
+  syncLogs: SyncLog[];
+}
+
+export interface NativeDeviceIdentity {
+  deviceId: string;
+  displayName?: string;
+  publicKey: string;
+  keystoreAlias?: string;
+}
+
 interface NodicSyncPlugin {
   getStatus(): Promise<SyncStatus>;
-  start(options: { displayName: string }): Promise<SyncStatus>;
+  start(options: { displayName: string; deviceId?: string; publicKey?: string }): Promise<SyncStatus>;
   stop(): Promise<SyncStatus>;
   publishEvent(options: { eventJson: string }): Promise<{ accepted: boolean; eventId: string }>;
   publishBatch(options: { batchJson: string }): Promise<{ accepted: boolean; batchId: string }>;
-  getDeviceIdentity(): Promise<{ deviceId: string; publicKey: string }>;
+  getDeviceIdentity(options?: { displayName?: string }): Promise<NativeDeviceIdentity>;
+  syncDeviceIdentity(options: {
+    deviceId: string;
+    displayName: string;
+    publicKey: string;
+  }): Promise<NativeDeviceIdentity>;
+  connectPeer(options: { host: string; port: number }): Promise<{ connected: boolean; host: string; port: number }>;
+  getDiagnostics(): Promise<NativeDiagnosticsSnapshot>;
+  clearLogs(): Promise<{ cleared: boolean }>;
   runProbe(): Promise<ProbeResult>;
   sendProbe(): Promise<{ accepted: boolean; probeId: string }>;
   addListener(eventName: 'statusChanged', listener: (status: SyncStatus) => void): Promise<PluginListenerHandle>;
@@ -23,16 +44,29 @@ interface NodicSyncPlugin {
     eventName: 'eventReceived',
     listener: (event: { eventJson: string; peerId: string }) => void,
   ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'peerIdentityUpdated',
+    listener: (peer: PeerIdentity) => void,
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'peerSessionUpdated',
+    listener: (session: PeerSession) => void,
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'syncLogAdded',
+    listener: (log: SyncLog) => void,
+  ): Promise<PluginListenerHandle>;
 }
 
 const nativePlugin = registerPlugin<NodicSyncPlugin>('NodicSync');
 
 const browserStatus: SyncStatus = {
   state: 'SEARCHING',
-  peerCount: 3,
-  pendingEventCount: 1,
-  lastSyncAt: new Date().toISOString(),
-  detail: 'Browser preview uses simulated peers',
+  peerCount: 0,
+  pendingEventCount: 0,
+  lastSyncAt: null,
+  detail: 'Browser preview ready for local storage and peer simulation',
+  localEndpoint: '127.0.0.1:8443',
 };
 
 export const nativeSync = {
@@ -42,13 +76,79 @@ export const nativeSync = {
     return Capacitor.isNativePlatform() ? nativePlugin.getStatus() : browserStatus;
   },
 
-  async start(displayName: string): Promise<SyncStatus> {
-    return Capacitor.isNativePlatform() ? nativePlugin.start({ displayName }) : browserStatus;
+  async start(displayName: string, deviceId?: string, publicKey?: string): Promise<SyncStatus> {
+    if (Capacitor.isNativePlatform()) {
+      return nativePlugin.start({ displayName, deviceId, publicKey });
+    }
+    browserStatus.state = 'SEARCHING';
+    browserStatus.detail = `Advertising as ${displayName}`;
+    return { ...browserStatus };
   },
 
   async stop(): Promise<SyncStatus> {
     if (Capacitor.isNativePlatform()) return nativePlugin.stop();
-    return { ...browserStatus, state: 'STOPPED', peerCount: 0 };
+    browserStatus.state = 'STOPPED';
+    browserStatus.peerCount = 0;
+    browserStatus.detail = 'Networking stopped';
+    return { ...browserStatus };
+  },
+
+  async getDeviceIdentity(displayName?: string): Promise<NativeDeviceIdentity> {
+    if (Capacitor.isNativePlatform()) {
+      return nativePlugin.getDeviceIdentity(displayName ? { displayName } : {});
+    }
+    const fallbackId = `web-${crypto.randomUUID().slice(0, 8)}`;
+    return {
+      deviceId: fallbackId,
+      displayName: displayName ?? `Node-${fallbackId.slice(0, 4).toUpperCase()}`,
+      publicKey: `p256:web-${fallbackId}`,
+      keystoreAlias: 'web-keystore',
+    };
+  },
+
+  async syncDeviceIdentity(options: {
+    deviceId: string;
+    displayName: string;
+    publicKey: string;
+  }): Promise<NativeDeviceIdentity> {
+    if (Capacitor.isNativePlatform()) {
+      return nativePlugin.syncDeviceIdentity(options);
+    }
+    return {
+      deviceId: options.deviceId,
+      displayName: options.displayName,
+      publicKey: options.publicKey,
+      keystoreAlias: 'web-keystore',
+    };
+  },
+
+  async connectPeer(host: string, port: number): Promise<{ connected: boolean; host: string; port: number }> {
+    if (Capacitor.isNativePlatform()) {
+      return nativePlugin.connectPeer({ host, port });
+    }
+    browserStatus.state = 'CONNECTED';
+    browserStatus.peerCount = Math.max(1, browserStatus.peerCount);
+    browserStatus.lastSyncAt = new Date().toISOString();
+    browserStatus.detail = `Connected to ${host}:${port}`;
+    return { connected: true, host, port };
+  },
+
+  async getDiagnostics(): Promise<NativeDiagnosticsSnapshot> {
+    if (Capacitor.isNativePlatform()) {
+      return nativePlugin.getDiagnostics();
+    }
+    return {
+      peerIdentities: [],
+      peerSessions: [],
+      syncLogs: [],
+    };
+  },
+
+  async clearLogs(): Promise<{ cleared: boolean }> {
+    if (Capacitor.isNativePlatform()) {
+      return nativePlugin.clearLogs();
+    }
+    return { cleared: true };
   },
 
   async publishEvent(event: NodicEvent): Promise<{ accepted: boolean; eventId: string }> {
@@ -69,16 +169,16 @@ export const nativeSync = {
     if (Capacitor.isNativePlatform()) return nativePlugin.runProbe();
     return Promise.resolve({
       pluginReady: false,
-      databaseReady: false,
-      serviceReady: false,
+      databaseReady: true,
+      serviceReady: browserStatus.state !== 'STOPPED',
       deviceId: 'browser-preview',
-      details: ['Native Phase 0 checks require an Android build.'],
+      details: ['Local storage database active. Build on Android for native NSD socket transport.'],
     });
   },
 
   sendProbe(): Promise<{ accepted: boolean; probeId: string }> {
     if (Capacitor.isNativePlatform()) return nativePlugin.sendProbe();
-    return Promise.resolve({ accepted: false, probeId: crypto.randomUUID() });
+    return Promise.resolve({ accepted: browserStatus.peerCount > 0, probeId: crypto.randomUUID() });
   },
 
   plugin: nativePlugin,

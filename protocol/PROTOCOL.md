@@ -20,10 +20,15 @@ Plugin name: `NodicSync`.
 | Method | Input | Output | Purpose |
 |---|---|---|---|
 | `getStatus` | `{}` | `SyncStatus` | Current foreground-service and peer state. |
-| `start` | `{ displayName: string }` | `SyncStatus` | Start the foreground sync service. |
+| `start` | `{ displayName: string; deviceId?: string; publicKey?: string }` | `SyncStatus` | Start the foreground sync service. |
 | `stop` | `{}` | `SyncStatus` | Stop local discovery and peer connections. |
 | `publishEvent` | `{ eventJson: string }` | `{ accepted: boolean; eventId: string }` | Persist/queue one validated local event for relay. |
-| `getDeviceIdentity` | `{}` | `{ deviceId: string; publicKey: string }` | Get or create the Keystore-backed identity. |
+| `publishBatch` | `{ batchJson: string }` | `{ accepted: boolean; batchId: string }` | Relay a batch of channel events to connected peers. |
+| `getDeviceIdentity` | `{ displayName?: string }` | `{ deviceId: string; displayName: string; publicKey: string; keystoreAlias: string }` | Get or create the Keystore-backed identity. |
+| `syncDeviceIdentity` | `{ deviceId: string; displayName: string; publicKey: string }` | `{ deviceId: string; displayName: string; publicKey: string; keystoreAlias: string }` | Sync updated identity to native store and re-announce to peers. |
+| `connectPeer` | `{ host: string; port: number }` | `{ connected: boolean; host: string; port: number }` | Initiate direct peer handshake and session establishment. |
+| `getDiagnostics` | `{}` | `{ peerIdentities: PeerIdentity[]; peerSessions: PeerSession[]; syncLogs: SyncLog[] }` | Read saved peer identities, sessions, and sync logs from native SQLite. |
+| `clearLogs` | `{}` | `{ cleared: boolean }` | Clear persisted sync logs. |
 | `runProbe` | `{}` | `ProbeResult` | Phase 0 native/database/service health check. |
 | `sendProbe` | `{}` | `{ accepted: boolean; probeId: string }` | Send one Phase 0 probe to discovered peers. |
 
@@ -34,6 +39,9 @@ Plugin name: `NodicSync`.
 | `statusChanged` | `SyncStatus` | Discovery, connectivity, or queue status changed. |
 | `eventReceived` | `{ eventJson: string; peerId: string }` | A remote event passed transport-level checks. |
 | `probeEventReceived` | `{ id: string; from: string; sentAt: string }` | Phase 0 test frame arrived. |
+| `peerIdentityUpdated` | `PeerIdentity` | Remote peer identity verified and persisted during handshake/event exchange. |
+| `peerSessionUpdated` | `PeerSession` | Inbound or outbound peer session created, updated, or closed. |
+| `syncLogAdded` | `SyncLog` | Connection, handshake, or sync log entry recorded. |
 
 Plugin methods must return structured errors with stable `code` and human-readable `message` fields.
 
