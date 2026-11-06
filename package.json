@@ -15,7 +15,11 @@
     "android:sync": "npm run build && cap sync android",
     "android:build": "npm run android:sync && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android.ps1",
     "android:open": "cap open android",
-    "android:run": "npm run android:sync && cap run android"
+    "android:run": "npm run android:sync && cap run android",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
+    "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
     "@capacitor-community/sqlite": "^8.1.1",

@@ -8,6 +8,13 @@
       "when": 1793726917529,
       "tag": "0000_steep_fallen_one",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1793982362752,
+      "tag": "0001_early_princess_powerful",
+      "breakpoints": true
     }
   ]
 }
