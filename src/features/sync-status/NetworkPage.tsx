@@ -6,9 +6,13 @@ import {
   checkmarkCircleOutline,
   refreshOutline,
   linkOutline,
+  batteryChargingOutline,
+  shieldCheckmarkOutline,
+  warningOutline,
+  notificationsOutline,
 } from 'ionicons/icons';
 import type { SyncStatus } from '../../../protocol/contracts';
-import { nativeSync, type ProbeResult } from '../../services/native-sync';
+import { nativeSync, type ProbeResult, type BatteryOptimizationStatus } from '../../services/native-sync';
 import { useWorkspace } from '../../app/workspace-context';
 import { ConfirmDialog } from '../../shared/Modal';
 
@@ -29,6 +33,7 @@ export function NetworkPage() {
 
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [probe, setProbe] = useState<ProbeResult | null>(null);
+  const [batteryStatus, setBatteryStatus] = useState<BatteryOptimizationStatus | null>(null);
 
   // Username edit state
   const [usernameInput, setUsernameInput] = useState('');
@@ -48,6 +53,7 @@ export function NetworkPage() {
 
   useEffect(() => {
     void nativeSync.getStatus().then(setStatus);
+    void nativeSync.getBatteryOptimizationStatus().then(setBatteryStatus);
     void refreshNetworkDiagnostics();
     if (!nativeSync.isNative()) return;
     const listener = nativeSync.plugin.addListener('statusChanged', (nextStatus) => {
@@ -314,6 +320,73 @@ export function NetworkPage() {
                 ))}
               </div>
             )}
+          </div>
+
+          {/* Card 2.5: Background Sync & Battery Optimization (Phase 4) */}
+          <div className="hub-card">
+            <h3>Background Operation & Battery Optimization</h3>
+            <p>Android foreground service and system policies governing offline LAN synchronization when the UI is closed.</p>
+
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '10px', marginBottom: '14px' }}>
+              <div style={{ padding: '10px', background: '#f8fafb', borderRadius: '8px', border: '1px solid var(--nodic-line)' }}>
+                <small style={{ color: 'var(--nodic-muted)', fontSize: '10px', display: 'block', textTransform: 'uppercase' }}>Foreground Service</small>
+                <strong style={{ fontSize: '13px', color: status?.state !== 'STOPPED' ? '#16a34a' : 'inherit' }}>
+                  {status?.state !== 'STOPPED' ? 'Active (Data Sync)' : 'Paused / Stopped'}
+                </strong>
+              </div>
+
+              <div style={{ padding: '10px', background: '#f8fafb', borderRadius: '8px', border: '1px solid var(--nodic-line)' }}>
+                <small style={{ color: 'var(--nodic-muted)', fontSize: '10px', display: 'block', textTransform: 'uppercase' }}>Battery Exemption</small>
+                <strong style={{ fontSize: '13px', color: batteryStatus?.ignoringBatteryOptimizations ? '#16a34a' : '#d97706' }}>
+                  {batteryStatus?.ignoringBatteryOptimizations ? 'Unrestricted' : 'Optimized'}
+                </strong>
+              </div>
+
+              <div style={{ padding: '10px', background: '#f8fafb', borderRadius: '8px', border: '1px solid var(--nodic-line)' }}>
+                <small style={{ color: 'var(--nodic-muted)', fontSize: '10px', display: 'block', textTransform: 'uppercase' }}>Hardware / OS</small>
+                <strong style={{ fontSize: '13px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>
+                  {batteryStatus?.manufacturer ? `${batteryStatus.manufacturer} ${batteryStatus.model ?? ''}` : 'Android Device'}
+                </strong>
+              </div>
+            </div>
+
+            {batteryStatus?.ignoringBatteryOptimizations ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', background: '#f0fdf4', border: '1px solid #bbf7d0', padding: '10px 12px', borderRadius: '8px', marginBottom: '12px' }}>
+                <IonIcon icon={shieldCheckmarkOutline} style={{ color: '#16a34a', fontSize: '20px', flexShrink: 0 }} />
+                <div style={{ fontSize: '12px', color: '#166534' }}>
+                  <strong>Battery optimization exempted.</strong> Android will not sleep Nodic when swiped away or when the screen is locked.
+                </div>
+              </div>
+            ) : (
+              <div style={{ background: '#fffbeb', border: '1px solid #fde68a', padding: '10px 12px', borderRadius: '8px', marginBottom: '12px' }}>
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', marginBottom: '8px' }}>
+                  <IonIcon icon={warningOutline} style={{ color: '#d97706', fontSize: '20px', flexShrink: 0, marginTop: '2px' }} />
+                  <div style={{ fontSize: '12px', color: '#92400e' }}>
+                    <strong>Aggressive battery savers may suspend sync.</strong> Many Android OEMs (Samsung, Xiaomi, Huawei, etc.) kill background foreground services unless battery optimization is set to Unrestricted.
+                  </div>
+                </div>
+                {batteryStatus?.canRequest && (
+                  <button
+                    className="dialog-btn-primary"
+                    style={{ padding: '6px 12px', fontSize: '12px' }}
+                    onClick={async () => {
+                      await nativeSync.requestIgnoreBatteryOptimizations();
+                      const next = await nativeSync.getBatteryOptimizationStatus();
+                      setBatteryStatus(next);
+                    }}
+                  >
+                    <IonIcon icon={batteryChargingOutline} style={{ marginRight: '6px', verticalAlign: 'middle' }} />
+                    Request Unrestricted Battery Exemption
+                  </button>
+                )}
+              </div>
+            )}
+
+            <div style={{ display: 'grid', gap: '6px', fontSize: '11px', color: 'var(--nodic-muted)' }}>
+              <div>• <strong>Network Recovery:</strong> Dynamic Wi-Fi reconnect and DHCP change rediscovery via ConnectivityManager.NetworkCallback.</div>
+              <div>• <strong>Boot Auto-Start:</strong> Automatic restart of foreground sync after device reboot via NodicBootReceiver.</div>
+              <div>• <strong>Content Notifications:</strong> Local notifications for chat messages, task assignments, and join requests with event-ID deduplication.</div>
+            </div>
           </div>
 
           {/* Card 3: Saved Peer Identities & Sessions */}

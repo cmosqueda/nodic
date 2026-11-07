@@ -1,8 +1,12 @@
 package dev.nodic.app.sync
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
 import com.getcapacitor.PermissionState
@@ -27,6 +31,73 @@ class NodicSyncPlugin : Plugin() {
 
     override fun load() {
         instance = WeakReference(this)
+    }
+
+    override fun handleOnResume() {
+        super.handleOnResume()
+        isAppInForeground = true
+    }
+
+    override fun handleOnPause() {
+        super.handleOnPause()
+        isAppInForeground = false
+    }
+
+    @PluginMethod
+    fun getPendingDeepLink(call: PluginCall) {
+        val link = pendingDeepLink
+        pendingDeepLink = null
+        call.resolve(link ?: JSObject())
+    }
+
+    @PluginMethod
+    fun setActiveRoute(call: PluginCall) {
+        val route = call.getString("route")
+        activeRoute = route
+        call.resolve(JSObject().put("route", route))
+    }
+
+    @PluginMethod
+    fun getBatteryOptimizationStatus(call: PluginCall) {
+        val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val isIgnoring = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            pm?.isIgnoringBatteryOptimizations(context.packageName) ?: false
+        } else {
+            true
+        }
+        call.resolve(
+            JSObject()
+                .put("ignoringBatteryOptimizations", isIgnoring)
+                .put("canRequest", Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+                .put("manufacturer", Build.MANUFACTURER)
+                .put("model", Build.MODEL),
+        )
+    }
+
+    @PluginMethod
+    fun requestIgnoreBatteryOptimizations(call: PluginCall) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                    data = Uri.parse("package:${context.packageName}")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+                call.resolve(JSObject().put("launched", true))
+            } catch (_: Exception) {
+                try {
+                    val fallbackIntent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(fallbackIntent)
+                    call.resolve(JSObject().put("launched", true))
+                } catch (err: Exception) {
+                    call.reject("Could not open battery optimization settings: ${err.message}")
+                }
+            }
+        } else {
+            call.resolve(JSObject().put("launched", false))
+        }
     }
 
     @PluginMethod
@@ -95,6 +166,18 @@ class NodicSyncPlugin : Plugin() {
         val id = UUID.randomUUID().toString()
         val accepted = NodicSyncService.broadcastBatch(id, batchJson)
         call.resolve(JSObject().put("accepted", accepted).put("batchId", id))
+    }
+
+    @PluginMethod
+    fun publishSummary(call: PluginCall) {
+        val summaryJson = call.getString("summaryJson")
+        if (summaryJson.isNullOrBlank()) {
+            call.reject("summaryJson is required", "INVALID_SUMMARY")
+            return
+        }
+        val id = UUID.randomUUID().toString()
+        val accepted = NodicSyncService.broadcastSummary(id, summaryJson)
+        call.resolve(JSObject().put("accepted", accepted))
     }
 
     @PluginMethod
@@ -217,6 +300,23 @@ class NodicSyncPlugin : Plugin() {
 
     companion object {
         private var instance = WeakReference<NodicSyncPlugin>(null)
+        var pendingDeepLink: JSObject? = null
+        var isAppInForeground: Boolean = false
+        var activeRoute: String? = null
+
+        fun handleDeepLink(route: String, channelId: String?, eventId: String?, taskId: String?) {
+            val payload = JSObject()
+                .put("route", route)
+                .put("channelId", channelId)
+                .put("eventId", eventId)
+                .put("taskId", taskId)
+            val plugin = instance.get()
+            if (plugin != null) {
+                plugin.emit("deepLinkOpened", payload)
+            } else {
+                pendingDeepLink = payload
+            }
+        }
 
         fun emitStatus(state: SyncState) = instance.get()?.emit("statusChanged", stateToJs(state))
 
@@ -226,6 +326,10 @@ class NodicSyncPlugin : Plugin() {
             if (eventJson != null) {
                 instance.get()?.emit("eventReceived", JSObject().put("eventJson", eventJson).put("peerId", from))
             }
+        }
+
+        fun emitSummaryReceived(peerId: String, summaryJson: String) {
+            instance.get()?.emit("summaryReceived", JSObject().put("summaryJson", summaryJson).put("peerId", peerId))
         }
 
         fun emitPeerIdentity(peerJson: JSONObject) {

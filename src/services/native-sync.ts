@@ -22,12 +22,27 @@ export interface NativeDeviceIdentity {
   keystoreAlias?: string;
 }
 
+export interface DeepLinkData {
+  route: string;
+  channelId?: string;
+  eventId?: string;
+  taskId?: string;
+}
+
+export interface BatteryOptimizationStatus {
+  ignoringBatteryOptimizations: boolean;
+  canRequest: boolean;
+  manufacturer?: string;
+  model?: string;
+}
+
 interface NodicSyncPlugin {
   getStatus(): Promise<SyncStatus>;
   start(options: { displayName: string; deviceId?: string; publicKey?: string }): Promise<SyncStatus>;
   stop(): Promise<SyncStatus>;
   publishEvent(options: { eventJson: string }): Promise<{ accepted: boolean; eventId: string }>;
   publishBatch(options: { batchJson: string }): Promise<{ accepted: boolean; batchId: string }>;
+  publishSummary(options: { summaryJson: string }): Promise<{ accepted: boolean }>;
   getDeviceIdentity(options?: { displayName?: string }): Promise<NativeDeviceIdentity>;
   syncDeviceIdentity(options: {
     deviceId: string;
@@ -39,10 +54,18 @@ interface NodicSyncPlugin {
   clearLogs(): Promise<{ cleared: boolean }>;
   runProbe(): Promise<ProbeResult>;
   sendProbe(): Promise<{ accepted: boolean; probeId: string }>;
+  getPendingDeepLink(): Promise<DeepLinkData>;
+  setActiveRoute(options: { route: string }): Promise<{ route: string }>;
+  getBatteryOptimizationStatus(): Promise<BatteryOptimizationStatus>;
+  requestIgnoreBatteryOptimizations(): Promise<{ launched: boolean }>;
   addListener(eventName: 'statusChanged', listener: (status: SyncStatus) => void): Promise<PluginListenerHandle>;
   addListener(
     eventName: 'eventReceived',
     listener: (event: { eventJson: string; peerId: string }) => void,
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'summaryReceived',
+    listener: (data: { summaryJson: string; peerId: string }) => void,
   ): Promise<PluginListenerHandle>;
   addListener(
     eventName: 'peerIdentityUpdated',
@@ -55,6 +78,10 @@ interface NodicSyncPlugin {
   addListener(
     eventName: 'syncLogAdded',
     listener: (log: SyncLog) => void,
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'deepLinkOpened',
+    listener: (data: DeepLinkData) => void,
   ): Promise<PluginListenerHandle>;
 }
 
@@ -165,6 +192,18 @@ export const nativeSync = {
     return { accepted: true, batchId: crypto.randomUUID() };
   },
 
+  async publishSummary(
+    channelId: string,
+    sequences: Record<string, number>,
+  ): Promise<{ accepted: boolean }> {
+    if (Capacitor.isNativePlatform()) {
+      return nativePlugin.publishSummary({
+        summaryJson: JSON.stringify({ channelId, sequences }),
+      });
+    }
+    return { accepted: true };
+  },
+
   runProbe(): Promise<ProbeResult> {
     if (Capacitor.isNativePlatform()) return nativePlugin.runProbe();
     return Promise.resolve({
@@ -179,6 +218,66 @@ export const nativeSync = {
   sendProbe(): Promise<{ accepted: boolean; probeId: string }> {
     if (Capacitor.isNativePlatform()) return nativePlugin.sendProbe();
     return Promise.resolve({ accepted: browserStatus.peerCount > 0, probeId: crypto.randomUUID() });
+  },
+
+  async getPendingDeepLink(): Promise<DeepLinkData | null> {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        const link = await nativePlugin.getPendingDeepLink();
+        return link?.route ? link : null;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  },
+
+  async setActiveRoute(route: string): Promise<void> {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        await nativePlugin.setActiveRoute({ route });
+      } catch {
+        // Ignore route report errors
+      }
+    }
+  },
+
+  async getBatteryOptimizationStatus(): Promise<BatteryOptimizationStatus> {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        return await nativePlugin.getBatteryOptimizationStatus();
+      } catch {
+        return {
+          ignoringBatteryOptimizations: false,
+          canRequest: false,
+          manufacturer: 'Android',
+        };
+      }
+    }
+    return {
+      ignoringBatteryOptimizations: true,
+      canRequest: false,
+      manufacturer: 'Web Browser',
+      model: 'Preview',
+    };
+  },
+
+  async requestIgnoreBatteryOptimizations(): Promise<{ launched: boolean }> {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        return await nativePlugin.requestIgnoreBatteryOptimizations();
+      } catch {
+        return { launched: false };
+      }
+    }
+    return { launched: false };
+  },
+
+  onDeepLinkOpened(listener: (data: DeepLinkData) => void): Promise<PluginListenerHandle> | null {
+    if (Capacitor.isNativePlatform()) {
+      return nativePlugin.addListener('deepLinkOpened', listener);
+    }
+    return null;
   },
 
   plugin: nativePlugin,

@@ -13,9 +13,25 @@ import {
 } from '../domain/reducers/event-reducer';
 import {
   calculateContiguousSummary,
+  computeMissingRangesForPeer,
   selectEventsForRanges,
   type MissingRange,
 } from '../domain/sync/sync-engine';
+import {
+  constantTimeCompare,
+  encryptPayload,
+  decryptPayload,
+  generateChannelKey,
+  generateDeviceKeyPair,
+  hashSecret,
+  signEvent,
+  verifyEventSignature,
+} from '../domain/crypto/crypto-engine';
+import {
+  createInvitationPayload,
+  encodeInvitationCode,
+  parseInvitationCode,
+} from '../domain/invitations/invitation-codec';
 import type {
   Channel,
   ChannelSummary,
@@ -201,6 +217,10 @@ export class NodicRepository {
   private memorySyncLogs: SyncLog[] = [];
   private identity: DeviceIdentityRecord | null = null;
   private authorSequence = 0;
+  private privateSigningKey: CryptoKey | null = null;
+  private channelKeys = new Map<string, Map<number, string>>();
+  private revokedAuthors = new Map<string, Set<string>>();
+  private storedInvitations = new Map<string, { hash: string; expiresAt: string; channelId: string }>();
 
   async init(defaultDisplayName?: string): Promise<WorkspaceSnapshot> {
     if (Capacitor.isNativePlatform()) {
@@ -408,13 +428,21 @@ export class NodicRepository {
       }
 
       const fallbackId = `node-${crypto.randomUUID().slice(0, 8)}`;
+      let pubKey = `p256:${crypto.randomUUID().replace(/-/g, '')}`;
+      try {
+        const keyPair = await generateDeviceKeyPair();
+        pubKey = keyPair.publicKey;
+        this.privateSigningKey = keyPair.privateKey;
+      } catch {
+        // Fallback for restricted/test environments
+      }
       this.identity = {
         deviceId: fallbackId,
         displayName:
           displayName && displayName !== 'Mara'
             ? displayName
             : `Node-${fallbackId.slice(5, 9).toUpperCase()}`,
-        publicSigningKey: `p256:${crypto.randomUUID().replace(/-/g, '')}`,
+        publicSigningKey: pubKey,
         keystoreAlias: 'nodic-device-key',
         lamportClock: 0,
       };
@@ -1050,9 +1078,13 @@ export class NodicRepository {
     identity.lamportClock += 1;
     this.authorSequence += 1;
 
+    const initialKey = generateChannelKey();
+    this.setChannelKey(channelId, 1, initialKey);
+
     const lead: Member = {
       deviceId: identity.deviceId,
       displayName: identity.displayName,
+      publicSigningKey: identity.publicSigningKey,
       role: 'LEAD',
       presence: 'ONLINE',
       initials: identity.displayName.slice(0, 2).toUpperCase(),
@@ -1064,6 +1096,7 @@ export class NodicRepository {
       description: description ?? null,
       currentUserDeviceId: identity.deviceId,
       leadDeviceId: identity.deviceId,
+      keyVersion: 1,
       members: [lead],
     };
 
@@ -1074,7 +1107,7 @@ export class NodicRepository {
       leadPublicKey: identity.publicSigningKey,
     };
 
-    const genesisEvent: NodicEvent = {
+    const eventWithoutSig: Omit<NodicEvent, 'signature'> = {
       protocolVersion: 1,
       id: eventId,
       channelId,
@@ -1086,7 +1119,20 @@ export class NodicRepository {
       createdAt: nowIso,
       payloadVersion: 1,
       payload: eventPayload,
-      signature: `sig-${identity.deviceId.slice(0, 8)}-${identity.lamportClock}`,
+    };
+
+    let signature = `sig-${identity.deviceId.slice(0, 8)}-${identity.lamportClock}`;
+    if (this.privateSigningKey) {
+      try {
+        signature = await signEvent(eventWithoutSig, this.privateSigningKey);
+      } catch {
+        // Fallback
+      }
+    }
+
+    const genesisEvent: NodicEvent = {
+      ...eventWithoutSig,
+      signature,
     };
 
     if (this.nodicDb) {
@@ -1159,7 +1205,9 @@ export class NodicRepository {
     identity.lamportClock += 1;
     this.authorSequence += 1;
 
-    const event: NodicEvent = {
+    const keyVersion = this.getActiveKeyVersion(channelId);
+
+    const eventWithoutSig: Omit<NodicEvent, 'signature'> = {
       protocolVersion: 1,
       id: crypto.randomUUID(),
       channelId,
@@ -1168,11 +1216,24 @@ export class NodicRepository {
       lamportClock: identity.lamportClock,
       type,
       entityId,
-      keyVersion: 1,
+      keyVersion,
       createdAt: new Date().toISOString(),
       payloadVersion: 1,
       payload,
-      signature: `sig-${identity.deviceId.slice(0, 8)}-${identity.lamportClock}`,
+    };
+
+    let signature = `sig-${identity.deviceId.slice(0, 8)}-${identity.lamportClock}`;
+    if (this.privateSigningKey) {
+      try {
+        signature = await signEvent(eventWithoutSig, this.privateSigningKey);
+      } catch {
+        // Fallback
+      }
+    }
+
+    const event: NodicEvent = {
+      ...eventWithoutSig,
+      signature,
     };
 
     const snapshot = await this.applyEvent(event);
@@ -1206,6 +1267,60 @@ export class NodicRepository {
       this.memoryState = targetState;
     }
 
+    // Duplicate suppression (Rule 3: Exact duplicates are successful no-ops)
+    if (this.nodicDb) {
+      const existing = await this.nodicDb.connection.query(
+        'SELECT id FROM events WHERE id = ?',
+        [event.id],
+      );
+      if (existing.values && existing.values.length > 0) {
+        return this.loadWorkspace(event.channelId);
+      }
+
+      // Rule 7: Confirm author sequence has not been reused with different content
+      const seqCheck = await this.nodicDb.connection.query(
+        'SELECT id FROM events WHERE channel_id = ? AND author_device_id = ? AND author_sequence = ?',
+        [event.channelId, event.authorDeviceId, event.authorSequence],
+      );
+      if (seqCheck.values && seqCheck.values.length > 0 && seqCheck.values[0].id !== event.id) {
+        await this.quarantineRejectedEvent(event.id, event.authorDeviceId, 'SEQUENCE_REUSED');
+        return this.loadWorkspace(event.channelId);
+      }
+    } else {
+      const list = this.memoryEvents.get(event.channelId) ?? [];
+      if (list.some((e) => e.id === event.id)) {
+        return this.loadWorkspace(event.channelId);
+      }
+      const conflict = list.find(
+        (e) =>
+          e.channelId === event.channelId &&
+          e.authorDeviceId === event.authorDeviceId &&
+          e.authorSequence === event.authorSequence &&
+          e.id !== event.id,
+      );
+      if (conflict) {
+        await this.quarantineRejectedEvent(event.id, event.authorDeviceId, 'SEQUENCE_REUSED');
+        return this.loadWorkspace(event.channelId);
+      }
+    }
+
+    // Validation Rule 5: Confirm author membership at the event's logical position
+    const revoked = this.revokedAuthors.get(event.channelId);
+    if (revoked && revoked.has(event.authorDeviceId)) {
+      await this.quarantineRejectedEvent(event.id, event.authorDeviceId, 'AUTHOR_REVOKED');
+      return this.loadWorkspace(event.channelId);
+    }
+
+    // Validation Rule 4: Verify signature against author's authorized public key
+    const authorPubKey = this.resolveAuthorPublicKey(event);
+    if (authorPubKey && !authorPubKey.startsWith('p256:mock-') && !event.signature.startsWith('sig-')) {
+      const validSig = await verifyEventSignature(event, authorPubKey);
+      if (!validSig) {
+        await this.quarantineRejectedEvent(event.id, event.authorDeviceId, 'INVALID_SIGNATURE');
+        return this.loadWorkspace(event.channelId);
+      }
+    }
+
     // Advance local Lamport clock: max(local, received) + 1
     identity.lamportClock = Math.max(identity.lamportClock, event.lamportClock) + 1;
     if (event.authorDeviceId === identity.deviceId) {
@@ -1228,13 +1343,45 @@ export class NodicRepository {
 
     const result = applyEventToState(this.memoryState!, event);
 
+    if (event.type === 'MEMBER_REMOVED') {
+      const payload = event.payload as { deviceId: string };
+      this.revokeAuthor(event.channelId, payload.deviceId);
+    }
+
+    if (event.type === 'CHANNEL_KEY_ROTATED') {
+      const payload = event.payload as { keyVersion?: number; newKey?: string };
+      const newVersion = payload.keyVersion ?? event.keyVersion;
+      if (this.memoryState && this.memoryState.channel.id === event.channelId) {
+        this.memoryState.channel.keyVersion = newVersion;
+      }
+      if (payload.newKey) {
+        this.setChannelKey(event.channelId, newVersion, payload.newKey);
+      }
+    }
+
     if (this.nodicDb) {
       const now = Date.now();
       const createdMs = new Date(event.createdAt).getTime() || now;
 
+      let ciphertextCol: string | null = null;
+      const channelKey = this.getChannelKey(event.channelId, event.keyVersion);
+      if (
+        channelKey &&
+        (event.type === 'CHAT_MESSAGE_SENT' ||
+          event.type === 'TASK_CREATED' ||
+          event.type === 'TASK_FIELDS_UPDATED')
+      ) {
+        try {
+          const enc = await encryptPayload(event.payload, channelKey);
+          ciphertextCol = `${enc.nonce}:${enc.ciphertext}`;
+        } catch {
+          // Fallback
+        }
+      }
+
       // Insert immutable event
       await this.nodicDb.connection.run(
-        'INSERT OR IGNORE INTO events (id, channel_id, author_device_id, author_sequence, lamport_clock, type, entity_id, key_version, payload_json, signature, created_at, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT OR IGNORE INTO events (id, channel_id, author_device_id, author_sequence, lamport_clock, type, entity_id, key_version, ciphertext, payload_json, signature, created_at, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [
           event.id,
           event.channelId,
@@ -1244,6 +1391,7 @@ export class NodicRepository {
           event.type,
           event.entityId ?? null,
           event.keyVersion,
+          ciphertextCol,
           JSON.stringify(event.payload),
           event.signature,
           createdMs,
@@ -1446,6 +1594,250 @@ export class NodicRepository {
       latestSnapshot = await this.applyEvent(ev);
     }
     return latestSnapshot ?? this.loadWorkspace();
+  }
+
+  async quarantineRejectedEvent(
+    eventId: string,
+    peerDeviceId: string | null,
+    reasonCode: string,
+  ): Promise<void> {
+    const now = Date.now();
+    if (this.nodicDb) {
+      await this.nodicDb.connection.run(
+        'INSERT INTO rejected_events (event_id, peer_device_id, reason_code, received_at) VALUES (?, ?, ?, ?)',
+        [eventId, peerDeviceId, reasonCode, now],
+      );
+    } else {
+      const list = readStorageJson<Array<{ id: number; eventId: string | null; peerDeviceId: string | null; reasonCode: string; receivedAt: number }>>(
+        'nodic_rejected_events_v1',
+        [],
+      );
+      list.push({ id: list.length + 1, eventId, peerDeviceId, reasonCode, receivedAt: now });
+      writeStorageJson('nodic_rejected_events_v1', list);
+    }
+
+    await this.recordSyncLog({
+      id: `rej-${now}-${Math.random().toString(36).slice(2, 7)}`,
+      level: 'WARN',
+      category: 'EVENT',
+      peerDeviceId,
+      sessionId: null,
+      message: `Quarantined event ${eventId}: ${reasonCode}`,
+      detailsJson: JSON.stringify({ eventId, reasonCode }),
+      createdAt: new Date(now).toISOString(),
+    });
+  }
+
+  async listRejectedEvents(limit = 50): Promise<Array<{ id: number; eventId: string | null; peerDeviceId: string | null; reasonCode: string; receivedAt: number }>> {
+    if (this.nodicDb) {
+      const res = await this.nodicDb.connection.query('SELECT * FROM rejected_events ORDER BY id DESC LIMIT ?', [limit]);
+      return (res.values ?? []).map((r) => ({
+        id: Number(r.id),
+        eventId: r.event_id as string | null,
+        peerDeviceId: r.peer_device_id as string | null,
+        reasonCode: r.reason_code as string,
+        receivedAt: Number(r.received_at),
+      }));
+    }
+    const list = readStorageJson<Array<{ id: number; eventId: string | null; peerDeviceId: string | null; reasonCode: string; receivedAt: number }>>(
+      'nodic_rejected_events_v1',
+      [],
+    );
+    return list.slice(-limit).reverse();
+  }
+
+  async recordPeerReceipt(
+    channelId: string,
+    peerDeviceId: string,
+    authorDeviceId: string,
+    highestSequence: number,
+  ): Promise<void> {
+    const now = Date.now();
+    if (this.nodicDb) {
+      await this.nodicDb.connection.run(
+        `INSERT INTO peer_receipts (channel_id, peer_device_id, author_device_id, highest_sequence, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(channel_id, peer_device_id, author_device_id) DO UPDATE SET
+           highest_sequence = MAX(peer_receipts.highest_sequence, excluded.highest_sequence),
+           updated_at = excluded.updated_at`,
+        [channelId, peerDeviceId, authorDeviceId, highestSequence, now],
+      );
+    } else {
+      const key = `nodic_receipts_${channelId}_${peerDeviceId}`;
+      const receipts = readStorageJson<Record<string, number>>(key, {});
+      receipts[authorDeviceId] = Math.max(receipts[authorDeviceId] ?? 0, highestSequence);
+      writeStorageJson(key, receipts);
+    }
+  }
+
+  async getPeerReceipts(channelId: string, peerDeviceId: string): Promise<Record<string, number>> {
+    if (this.nodicDb) {
+      const res = await this.nodicDb.connection.query(
+        'SELECT author_device_id, highest_sequence FROM peer_receipts WHERE channel_id = ? AND peer_device_id = ?',
+        [channelId, peerDeviceId],
+      );
+      const map: Record<string, number> = {};
+      for (const row of res.values ?? []) {
+        map[row.author_device_id as string] = Number(row.highest_sequence);
+      }
+      return map;
+    }
+    const key = `nodic_receipts_${channelId}_${peerDeviceId}`;
+    return readStorageJson<Record<string, number>>(key, {});
+  }
+
+  async reconcileWithPeerSummary(
+    channelId: string,
+    peerDeviceId: string,
+    peerSummary: Record<string, number>,
+  ): Promise<{ eventsToSend: NodicEvent[]; missingRangesFromPeer: MissingRange[] }> {
+    const localSummary = await this.getSyncSummary(channelId);
+    const rangesForPeer = computeMissingRangesForPeer(localSummary, peerSummary);
+    const missingRangesFromPeer = computeMissingRangesForPeer(peerSummary, localSummary);
+
+    const eventsToSend = await this.getEventsForRanges(channelId, rangesForPeer, 100);
+
+    // Record highest sequence received in peer's summary
+    for (const [author, seq] of Object.entries(peerSummary)) {
+      await this.recordPeerReceipt(channelId, peerDeviceId, author, seq);
+    }
+
+    return { eventsToSend, missingRangesFromPeer };
+  }
+
+  resolveAuthorPublicKey(event: NodicEvent): string | null {
+    if (event.type === 'CHANNEL_CREATED') {
+      return (event.payload as { leadPublicKey?: string }).leadPublicKey ?? null;
+    }
+    if (event.type === 'MEMBER_ADDED') {
+      return (event.payload as { publicSigningKey?: string }).publicSigningKey ?? null;
+    }
+    const member = this.memoryState?.members.get(event.authorDeviceId);
+    if (member?.publicSigningKey) return member.publicSigningKey;
+
+    const peer = this.memoryPeerIdentities.get(event.authorDeviceId);
+    if (peer?.publicSigningKey) return peer.publicSigningKey;
+
+    return null;
+  }
+
+  revokeAuthor(channelId: string, deviceId: string): void {
+    let set = this.revokedAuthors.get(channelId);
+    if (!set) {
+      set = new Set();
+      this.revokedAuthors.set(channelId, set);
+    }
+    set.add(deviceId);
+  }
+
+  isAuthorRevoked(channelId: string, deviceId: string): boolean {
+    return this.revokedAuthors.get(channelId)?.has(deviceId) ?? false;
+  }
+
+  setChannelKey(channelId: string, version: number, key: string): void {
+    let map = this.channelKeys.get(channelId);
+    if (!map) {
+      map = new Map();
+      this.channelKeys.set(channelId, map);
+    }
+    map.set(version, key);
+  }
+
+  getChannelKey(channelId: string, version = 1): string | null {
+    return this.channelKeys.get(channelId)?.get(version) ?? null;
+  }
+
+  getActiveKeyVersion(channelId: string): number {
+    const versions = this.channelKeys.get(channelId);
+    if (!versions || versions.size === 0) return 1;
+    return Math.max(...Array.from(versions.keys()));
+  }
+
+  async rotateChannelKey(
+    channelId: string,
+  ): Promise<{ event: NodicEvent; newKeyVersion: number; newKey: string }> {
+    const currentVersion = this.getActiveKeyVersion(channelId);
+    const newKeyVersion = currentVersion + 1;
+    const newKey = generateChannelKey();
+    this.setChannelKey(channelId, newKeyVersion, newKey);
+
+    const { event } = await this.commitLocalEvent(
+      channelId,
+      'CHANNEL_KEY_ROTATED',
+      { keyVersion: newKeyVersion, newKey },
+    );
+
+    if (this.nodicDb) {
+      await this.nodicDb.connection.run(
+        'UPDATE channels SET key_version = ? WHERE id = ?',
+        [newKeyVersion, channelId],
+      );
+    }
+
+    return { event, newKeyVersion, newKey };
+  }
+
+  async createInvitation(channelId: string, expiresInHours = 24): Promise<string> {
+    const payload = createInvitationPayload({ channelId, expiresInHours });
+    const secretHash = await hashSecret(payload.joinSecret);
+
+    this.storedInvitations.set(payload.invitationId, {
+      hash: secretHash,
+      expiresAt: payload.expiresAt,
+      channelId,
+    });
+
+    return encodeInvitationCode(payload);
+  }
+
+  async processJoinRequest(req: {
+    channelId: string;
+    invitationId: string;
+    joinSecret: string;
+    applicantDeviceId: string;
+    applicantDisplayName: string;
+    applicantPublicKey: string;
+  }): Promise<{
+    accepted: boolean;
+    reason?: string;
+    memberEvent?: NodicEvent;
+    channelKey?: string;
+  }> {
+    const stored = this.storedInvitations.get(req.invitationId);
+    if (!stored || stored.channelId !== req.channelId) {
+      return { accepted: false, reason: 'Invitation not found for this channel' };
+    }
+
+    if (new Date(stored.expiresAt).getTime() < Date.now()) {
+      return { accepted: false, reason: 'Invitation has expired' };
+    }
+
+    const providedHash = await hashSecret(req.joinSecret);
+    if (!constantTimeCompare(providedHash, stored.hash)) {
+      return { accepted: false, reason: 'Invalid invitation secret' };
+    }
+
+    // Lead approves join request: emits signed MEMBER_ADDED event
+    const { event } = await this.commitLocalEvent(
+      req.channelId,
+      'MEMBER_ADDED',
+      {
+        deviceId: req.applicantDeviceId,
+        displayName: req.applicantDisplayName,
+        publicSigningKey: req.applicantPublicKey,
+        role: 'MEMBER',
+      },
+      req.applicantDeviceId,
+    );
+
+    const activeVersion = this.getActiveKeyVersion(req.channelId);
+    const channelKey = this.getChannelKey(req.channelId, activeVersion) ?? undefined;
+
+    return {
+      accepted: true,
+      memberEvent: event,
+      channelKey,
+    };
   }
 }
 

@@ -48,6 +48,7 @@ export function applyEventToState(
         name?: string;
         description?: string;
         leadDisplayName?: string;
+        leadPublicKey?: string;
       };
       state.channel.name = payload.name ?? state.channel.name;
       state.channel.description = payload.description ?? null;
@@ -56,6 +57,7 @@ export function applyEventToState(
       const lead: Member = {
         deviceId: event.authorDeviceId,
         displayName: effectiveLeadName,
+        publicSigningKey: payload.leadPublicKey ?? author?.publicSigningKey,
         role: 'LEAD',
         presence: 'ONLINE',
         initials: effectiveLeadName.slice(0, 2).toUpperCase(),
@@ -70,12 +72,14 @@ export function applyEventToState(
       const payload = event.payload as {
         deviceId: string;
         displayName: string;
+        publicSigningKey?: string;
         role?: MemberRole;
       };
       const existing = state.members.get(payload.deviceId);
       const member: Member = {
         deviceId: payload.deviceId,
         displayName: payload.displayName,
+        publicSigningKey: payload.publicSigningKey ?? existing?.publicSigningKey,
         role: payload.role ?? existing?.role ?? 'MEMBER',
         presence: existing?.presence ?? 'ONLINE',
         initials: payload.displayName.slice(0, 2).toUpperCase(),
@@ -93,19 +97,60 @@ export function applyEventToState(
         existing.role = payload.role;
         state.channel.members = Array.from(state.members.values());
         result.updatedMembers.push(existing);
+
+        const systemMsg: Message = {
+          id: `sys-role-chg-${event.id}`,
+          channelId: event.channelId,
+          kind: 'SYSTEM',
+          authorDeviceId: event.authorDeviceId,
+          body: `${existing.displayName}'s role was changed to ${payload.role}.`,
+          createdAt: event.createdAt,
+          pending: false,
+        };
+        state.messages.push(systemMsg);
+        result.updatedMessages.push(systemMsg);
       }
       break;
     }
 
     case 'MEMBER_REMOVED': {
-      const payload = event.payload as { deviceId: string };
+      const payload = event.payload as { deviceId: string; displayName?: string };
       const existing = state.members.get(payload.deviceId);
+      const name = existing?.displayName ?? payload.displayName ?? payload.deviceId.slice(0, 8);
       if (existing) {
         existing.presence = 'OFFLINE';
         state.members.delete(payload.deviceId);
         state.channel.members = Array.from(state.members.values());
         result.updatedMembers.push(existing);
       }
+      const systemMsg: Message = {
+        id: `sys-mem-rem-${event.id}`,
+        channelId: event.channelId,
+        kind: 'SYSTEM',
+        authorDeviceId: event.authorDeviceId,
+        body: `${name} was removed from the channel.`,
+        createdAt: event.createdAt,
+        pending: false,
+      };
+      state.messages.push(systemMsg);
+      result.updatedMessages.push(systemMsg);
+      break;
+    }
+
+    case 'CHANNEL_KEY_ROTATED': {
+      const payload = event.payload as { keyVersion?: number };
+      const newVersion = payload.keyVersion ?? event.keyVersion;
+      const systemMsg: Message = {
+        id: `sys-key-rot-${event.id}`,
+        channelId: event.channelId,
+        kind: 'SYSTEM',
+        authorDeviceId: event.authorDeviceId,
+        body: `Channel security key rotated to version ${newVersion}.`,
+        createdAt: event.createdAt,
+        pending: false,
+      };
+      state.messages.push(systemMsg);
+      result.updatedMessages.push(systemMsg);
       break;
     }
 

@@ -3,6 +3,7 @@ import type { MemberRole, TaskPriority, TaskStatus } from '../../protocol/contra
 export interface Member {
   deviceId: string;
   displayName: string;
+  publicSigningKey?: string;
   role: MemberRole;
   presence: 'ONLINE' | 'RECENT' | 'OFFLINE';
   initials: string;
@@ -38,6 +39,7 @@ export interface Channel {
   description: string | null;
   currentUserDeviceId: string;
   leadDeviceId?: string;
+  keyVersion?: number;
   members: Member[];
 }
 
@@ -46,6 +48,7 @@ export interface ChannelSummary {
   name: string;
   description: string | null;
   leadDeviceId?: string;
+  keyVersion?: number;
 }
 
 export interface WorkspaceSnapshot {

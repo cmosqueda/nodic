@@ -22,6 +22,7 @@ import {
   encodeInvitationCode,
   parseInvitationCode,
 } from '../domain/invitations/invitation-codec';
+import { filterPeersForRelay } from '../domain/sync/sync-engine';
 import { repository } from '../db/repository';
 import { nativeSync } from '../services/native-sync';
 
@@ -174,12 +175,22 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
             const logs = await repository.listSyncLogs();
             if (!unmounted) setSyncLogs(logs);
 
-            // When a remote member joins our channel, send them all existing events for that channel
+            // Phase 2: When remote member joins or summary is needed, exchange vector summaries
             if (event.type === 'MEMBER_ADDED') {
-              const allEvents = await repository.getAllChannelEvents(event.channelId);
-              if (allEvents.length > 0) {
-                void nativeSync.publishBatch(allEvents);
-              }
+              const summary = await repository.getSyncSummary(event.channelId);
+              void nativeSync.publishSummary(event.channelId, summary);
+            }
+
+            // Phase 2: Relay to other peers if not sender and not local author
+            const peers = await repository.listPeerIdentities();
+            const currentIdentity = await repository.getIdentity();
+            const relayPeers = filterPeersForRelay(
+              peers.map((p) => p.deviceId),
+              data.peerId,
+              currentIdentity.deviceId,
+            );
+            if (relayPeers.length > 0 && event.authorDeviceId !== currentIdentity.deviceId) {
+              void nativeSync.publishEvent(event);
             }
           });
         } catch (error) {
@@ -187,12 +198,33 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         }
       });
 
+      const summaryListener = nativeSync.plugin.addListener('summaryReceived', (data) => {
+        try {
+          const payload = JSON.parse(data.summaryJson) as {
+            channelId?: string;
+            sequences?: Record<string, number>;
+          };
+          const targetChannelId = payload.channelId ?? workspace.channel?.id;
+          const sequences = payload.sequences ?? {};
+          if (targetChannelId) {
+            void repository
+              .reconcileWithPeerSummary(targetChannelId, data.peerId, sequences)
+              .then(async ({ eventsToSend }) => {
+                if (eventsToSend.length > 0) {
+                  void nativeSync.publishBatch(eventsToSend);
+                }
+              });
+          }
+        } catch (error) {
+          console.warn('Failed to process incoming peer summary:', error);
+        }
+      });
+
       const statusListener = nativeSync.plugin.addListener('statusChanged', (status) => {
         if (status.state === 'CONNECTED' && status.peerCount > 0 && workspace.channel?.id) {
-          void repository.getAllChannelEvents(workspace.channel.id).then((events) => {
-            if (events.length > 0) {
-              void nativeSync.publishBatch(events);
-            }
+          // Phase 2: Send concise vector summary on connection instead of blind database dump
+          void repository.getSyncSummary(workspace.channel.id).then((summary) => {
+            void nativeSync.publishSummary(workspace.channel!.id, summary);
           });
         }
       });
@@ -230,6 +262,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
       return () => {
         unmounted = true;
         void eventListener.then((h) => h.remove());
+        void summaryListener.then((h) => h.remove());
         void statusListener.then((h) => h.remove());
         void peerIdentityListener.then((h) => h.remove());
         void peerSessionListener.then((h) => h.remove());
@@ -525,17 +558,22 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
           return;
         }
 
-        const { event, snapshot } = await repository.commitLocalEvent(
+        const { event: removeEvent, snapshot } = await repository.commitLocalEvent(
           workspace.channel.id,
           'MEMBER_REMOVED',
           { deviceId },
           deviceId,
         );
+        repository.revokeAuthor(workspace.channel.id, deviceId);
+
+        // Phase 3: Automatically rotate channel key for forward secrecy
+        const { event: rotateEvent } = await repository.rotateChannelKey(workspace.channel.id);
 
         setWorkspace(snapshot);
         await syncIdentityState();
         await refreshDiagnosticsState();
-        void nativeSync.publishEvent(event);
+        void nativeSync.publishEvent(removeEvent);
+        void nativeSync.publishEvent(rotateEvent);
       },
     }),
     [workspace, identity, isReady, channels, peerIdentities, peerSessions, syncLogs],

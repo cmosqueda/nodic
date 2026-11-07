@@ -6,8 +6,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import dev.nodic.app.MainActivity
@@ -23,6 +29,8 @@ import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.time.Instant
+import java.util.Collections
+import java.util.LinkedHashSet
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -42,8 +50,12 @@ class NodicSyncService : Service() {
     private val executor = Executors.newCachedThreadPool()
     private val nsdPeers = ConcurrentHashMap<String, NsdServiceInfo>()
     private val connectedPeers = ConcurrentHashMap<String, ConnectedPeerEndpoint>()
+    private val notifiedEventIds = Collections.synchronizedSet(LinkedHashSet<String>())
     private lateinit var nsdManager: NsdManager
     private lateinit var store: PhaseZeroStore
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var lastResolvedIp: String? = null
     private var serverSocket: ServerSocket? = null
     private var serviceName = ""
     private var listenPort = 0
@@ -55,7 +67,7 @@ class NodicSyncService : Service() {
         liveService = this
         nsdManager = getSystemService(Context.NSD_SERVICE) as NsdManager
         store = PhaseZeroStore(this)
-        createNotificationChannel()
+        createNotificationChannels()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -84,6 +96,7 @@ class NodicSyncService : Service() {
 
     private fun startNetworking() {
         updateState(SyncState(state = "SEARCHING", detail = "Advertising on local Wi-Fi"))
+        registerNetworkCallback()
         executor.execute {
             try {
                 val identity = store.getOrCreateLocalIdentity()
@@ -92,6 +105,7 @@ class NodicSyncService : Service() {
                 listenPort = socket.localPort
                 serviceName = "nodic-${identity.deviceId.take(8)}"
                 val localIp = resolveLocalIpv4Address() ?: "0.0.0.0"
+                lastResolvedIp = localIp
                 val endpoint = "$localIp:$listenPort"
 
                 val logObj = store.insertLog(
@@ -272,8 +286,8 @@ class NodicSyncService : Service() {
                     return
                 }
 
-                if (kind != "PROBE" && kind != "EVENT" && kind != "EVENT_BATCH") return
-                val id = frame.getString("id")
+                if (kind != "PROBE" && kind != "EVENT" && kind != "EVENT_BATCH" && kind != "SUMMARY") return
+                val id = frame.optString("id").takeIf { it.isNotBlank() } ?: frame.optString("requestId", UUID.randomUUID().toString())
                 val sentAt = frame.optString("sentAt", Instant.now().toString())
                 val from = frame.optString("from", remoteHost)
                 val senderDeviceId = frame.optString("deviceId").takeIf { it.isNotBlank() } ?: from
@@ -317,7 +331,10 @@ class NodicSyncService : Service() {
                 }
 
                 var receivedEventCount = 0
-                if (kind == "EVENT_BATCH") {
+                if (kind == "SUMMARY") {
+                    val summaryObj = frame.optJSONObject("summary") ?: frame
+                    NodicSyncPlugin.emitSummaryReceived(senderDeviceId, summaryObj.toString())
+                } else if (kind == "EVENT_BATCH") {
                     val batchArray = frame.optJSONArray("events")
                     if (batchArray != null) {
                         receivedEventCount = batchArray.length()
@@ -325,12 +342,36 @@ class NodicSyncService : Service() {
                             val ev = batchArray.getJSONObject(i)
                             val evId = ev.optString("id", UUID.randomUUID().toString())
                             NodicSyncPlugin.emitReceived(evId, senderDeviceId, sentAt, ev.toString())
+                            processReceivedEventForNotification(ev, senderDisplayName)
                         }
                     }
+                } else if (kind == "JOIN_REQUEST") {
+                    val applicantName = frame.optString("applicantDisplayName", "Applicant")
+                    val channelId = frame.optString("channelId").takeIf { it.isNotBlank() }
+                    val requestId = frame.optString("requestId", id)
+                    if (shouldNotifyEvent(requestId)) {
+                        postContentNotification(
+                            id = requestId.hashCode(),
+                            channel = CHANNEL_MEMBERSHIP,
+                            title = "Join Request",
+                            body = "$applicantName requested to join channel",
+                            route = "/members",
+                            channelId = channelId,
+                            eventId = requestId,
+                            taskId = null,
+                        )
+                    }
+                    val eventJson = frame.optString("eventJson").takeIf { it.isNotBlank() }
+                    NodicSyncPlugin.emitReceived(id, senderDeviceId, sentAt, eventJson ?: frame.toString())
                 } else {
                     val eventJson = frame.optString("eventJson").takeIf { it.isNotBlank() }
                     receivedEventCount = if (eventJson != null) 1 else 0
                     NodicSyncPlugin.emitReceived(id, senderDeviceId, sentAt, eventJson)
+                    if (eventJson != null) {
+                        try {
+                            processReceivedEventForNotification(JSONObject(eventJson), senderDisplayName)
+                        } catch (_: Exception) {}
+                    }
                 }
 
                 if (senderDeviceId != localIdentity.deviceId) {
@@ -382,7 +423,6 @@ class NodicSyncService : Service() {
                         detail = "Received ${kind.lowercase()} from $senderDisplayName",
                     ),
                 )
-                showReceiptNotification(senderDisplayName)
             } catch (error: Exception) {
                 val logJson = store.insertLog(
                     level = "WARN",
@@ -702,6 +742,47 @@ class NodicSyncService : Service() {
         return true
     }
 
+    private fun sendSummaryFrame(id: String, summaryJson: String): Boolean {
+        val snapshot = collectTargetEndpoints()
+        if (snapshot.isEmpty()) return false
+        val localIdentity = store.getOrCreateLocalIdentity()
+        val summaryObj = JSONObject(summaryJson)
+
+        snapshot.forEach { peer ->
+            executor.execute {
+                try {
+                    Socket().use { socket ->
+                        socket.connect(InetSocketAddress(peer.host, peer.port), 3_000)
+                        socket.soTimeout = 5_000
+                        val frame = JSONObject()
+                            .put("kind", "SUMMARY")
+                            .put("id", id)
+                            .put("requestId", id)
+                            .put("sessionId", peer.sessionId)
+                            .put("from", serviceName)
+                            .put("deviceId", localIdentity.deviceId)
+                            .put("displayName", localIdentity.displayName)
+                            .put("publicKey", localIdentity.publicKey)
+                            .put("listenPort", listenPort)
+                            .put("sentAt", Instant.now().toString())
+                            .put("summary", summaryObj)
+                        PrintWriter(socket.getOutputStream(), true).println(frame.toString())
+                    }
+                } catch (error: Exception) {
+                    val logJson = store.insertLog(
+                        level = "WARN",
+                        category = "SYNC",
+                        peerDeviceId = peer.deviceId,
+                        sessionId = peer.sessionId,
+                        message = "Summary send failed with ${peer.displayName}: ${error.message}",
+                    )
+                    NodicSyncPlugin.emitLogAdded(logJson)
+                }
+            }
+        }
+        return true
+    }
+
     private fun reannounceIdentity() {
         val snapshot = collectTargetEndpoints()
         for (peer in snapshot) {
@@ -806,6 +887,7 @@ class NodicSyncService : Service() {
     }
 
     private fun stopNetworking() {
+        unregisterNetworkCallback()
         try { if (discovering) nsdManager.stopServiceDiscovery(discoveryListener) } catch (_: Exception) {}
         try { if (registered) nsdManager.unregisterService(registrationListener) } catch (_: Exception) {}
         try { serverSocket?.close() } catch (_: Exception) {}
@@ -827,40 +909,356 @@ class NodicSyncService : Service() {
         stopSelf()
     }
 
-    private fun createNotificationChannel() {
-        val channel = NotificationChannel(CHANNEL_ID, "Nodic local network", NotificationManager.IMPORTANCE_LOW).apply {
-            description = "Keeps Nodic available to nearby department devices"
+    private fun restartNsd() {
+        try {
+            if (discovering) {
+                nsdManager.stopServiceDiscovery(discoveryListener)
+                discovering = false
+            }
+        } catch (_: Exception) {}
+        try {
+            if (registered) {
+                nsdManager.unregisterService(registrationListener)
+                registered = false
+            }
+        } catch (_: Exception) {}
+        if (listenPort > 0) {
+            registerService(listenPort)
+            discoverServices()
         }
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
-    private fun buildNotification(detail: String) = NotificationCompat.Builder(this, CHANNEL_ID)
-        .setSmallIcon(R.drawable.ic_stat_nodic)
-        .setContentTitle("Nodic network is active")
-        .setContentText(detail)
-        .setOngoing(true)
-        .setContentIntent(
-            PendingIntent.getActivity(
-                this,
-                0,
-                Intent(this, MainActivity::class.java),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        connectivityManager = cm
+
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                handleNetworkStateChange("Network available")
+            }
+
+            override fun onLost(network: Network) {
+                handleNetworkLost()
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                handleNetworkStateChange("Link properties changed")
+            }
+        }
+        networkCallback = callback
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                cm.registerDefaultNetworkCallback(callback)
+            } else {
+                val request = NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build()
+                cm.registerNetworkCallback(request, callback)
+            }
+        } catch (e: Exception) {
+            val logObj = store.insertLog(
+                level = "WARN",
+                category = "DISCOVERY",
+                peerDeviceId = null,
+                sessionId = null,
+                message = "Could not register network callback: ${e.message}",
+            )
+            NodicSyncPlugin.emitLogAdded(logObj)
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        try {
+            networkCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
+        } catch (_: Exception) {}
+        networkCallback = null
+    }
+
+    private fun handleNetworkStateChange(reason: String) {
+        executor.execute {
+            val currentIp = resolveLocalIpv4Address()
+            if (currentIp == null) {
+                handleNetworkLost()
+                return@execute
+            }
+
+            if (currentIp != lastResolvedIp && serverSocket != null) {
+                val oldIp = lastResolvedIp
+                lastResolvedIp = currentIp
+                val newEndpoint = "$currentIp:$listenPort"
+
+                val logObj = store.insertLog(
+                    level = "INFO",
+                    category = "DISCOVERY",
+                    peerDeviceId = null,
+                    sessionId = null,
+                    message = "Network state recovery ($reason): IP changed from $oldIp to $currentIp, re-announcing NSD",
+                    detailsJson = JSONObject().put("endpoint", newEndpoint).toString(),
+                )
+                NodicSyncPlugin.emitLogAdded(logObj)
+
+                updateState(
+                    currentState.copy(
+                        state = "SEARCHING",
+                        detail = "Listening on $newEndpoint",
+                        localEndpoint = newEndpoint,
+                    ),
+                )
+                restartNsd()
+            }
+        }
+    }
+
+    private fun handleNetworkLost() {
+        updateState(
+            currentState.copy(
+                state = "OFFLINE",
+                detail = "Local Wi-Fi disconnected. Waiting for connection...",
             ),
         )
-        .build()
+        val logObj = store.insertLog(
+            level = "WARN",
+            category = "DISCOVERY",
+            peerDeviceId = null,
+            sessionId = null,
+            message = "Local network connection lost",
+        )
+        NodicSyncPlugin.emitLogAdded(logObj)
+    }
 
-    private fun showReceiptNotification(from: String) {
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+    private fun createNotificationChannels() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = getSystemService(NotificationManager::class.java)
+
+            val fgChannel = NotificationChannel(
+                CHANNEL_FOREGROUND,
+                "Nodic Background Sync",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = "Keeps Nodic network and discovery active in the background"
+                setShowBadge(false)
+            }
+
+            val msgChannel = NotificationChannel(
+                CHANNEL_MESSAGES,
+                "Chat Messages",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Notifications for incoming chat messages"
+                enableVibration(true)
+                setShowBadge(true)
+            }
+
+            val taskChannel = NotificationChannel(
+                CHANNEL_TASKS,
+                "Task Updates",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Notifications for task assignments, updates, and completions"
+                enableVibration(true)
+                setShowBadge(true)
+            }
+
+            val memberChannel = NotificationChannel(
+                CHANNEL_MEMBERSHIP,
+                "Membership & Invites",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Notifications for join requests and member approvals"
+                enableVibration(true)
+                setShowBadge(true)
+            }
+
+            nm.createNotificationChannels(listOf(fgChannel, msgChannel, taskChannel, memberChannel))
+        }
+    }
+
+    private fun buildNotification(detail: String): android.app.Notification {
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("route", "/network")
+        }
+        val openPendingIntent = PendingIntent.getActivity(
+            this,
+            1001,
+            openIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+
+        val pauseIntent = Intent(this, NodicSyncService::class.java).apply {
+            action = ACTION_STOP
+        }
+        val pausePendingIntent = PendingIntent.getService(
+            this,
+            1002,
+            pauseIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+
+        return NotificationCompat.Builder(this, CHANNEL_FOREGROUND)
             .setSmallIcon(R.drawable.ic_stat_nodic)
-            .setContentTitle("Nodic sync activity")
-            .setContentText("Received update from ${from.take(24)}")
-            .setAutoCancel(true)
+            .setContentTitle("Nodic network is active")
+            .setContentText(detail)
+            .setOngoing(true)
+            .setContentIntent(openPendingIntent)
+            .addAction(0, "Open", openPendingIntent)
+            .addAction(0, "Pause", pausePendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
-        getSystemService(NotificationManager::class.java).notify(RECEIPT_NOTIFICATION_ID, notification)
+    }
+
+    private fun shouldNotifyEvent(eventId: String): Boolean {
+        synchronized(notifiedEventIds) {
+            if (notifiedEventIds.contains(eventId)) return false
+            if (notifiedEventIds.size >= 1000) {
+                val it = notifiedEventIds.iterator()
+                if (it.hasNext()) {
+                    it.next()
+                    it.remove()
+                }
+            }
+            notifiedEventIds.add(eventId)
+            return true
+        }
+    }
+
+    private fun postContentNotification(
+        id: Int,
+        channel: String,
+        title: String,
+        body: String,
+        route: String,
+        channelId: String?,
+        eventId: String?,
+        taskId: String?,
+    ) {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("route", route)
+            if (channelId != null) putExtra("channelId", channelId)
+            if (eventId != null) putExtra("eventId", eventId)
+            if (taskId != null) putExtra("taskId", taskId)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            id,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
+        val notification = NotificationCompat.Builder(this, channel)
+            .setSmallIcon(R.drawable.ic_stat_nodic)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+
+        getSystemService(NotificationManager::class.java).notify(id, notification)
+    }
+
+    private fun processReceivedEventForNotification(ev: JSONObject, senderDisplayName: String) {
+        val eventId = ev.optString("id")
+        if (eventId.isBlank()) return
+        if (!shouldNotifyEvent(eventId)) return
+
+        val localIdentity = store.getOrCreateLocalIdentity()
+        val authorDeviceId = ev.optString("authorDeviceId")
+        if (authorDeviceId == localIdentity.deviceId) return
+
+        val type = ev.optString("type")
+        val channelId = ev.optString("channelId").takeIf { it.isNotBlank() }
+        val payload = ev.optJSONObject("payload") ?: JSONObject()
+
+        when (type) {
+            "MESSAGE_POSTED" -> {
+                if (NodicSyncPlugin.isAppInForeground && NodicSyncPlugin.activeRoute == "/chat") {
+                    return
+                }
+                val text = payload.optString("text")
+                val sender = senderDisplayName.ifBlank { "Nodic member" }
+                postContentNotification(
+                    id = eventId.hashCode(),
+                    channel = CHANNEL_MESSAGES,
+                    title = sender,
+                    body = text.ifBlank { "Sent a message" },
+                    route = "/chat",
+                    channelId = channelId,
+                    eventId = eventId,
+                    taskId = null,
+                )
+            }
+            "TASK_CREATED" -> {
+                val assignee = payload.optString("assigneeDeviceId")
+                val title = payload.optString("title", "Untitled task")
+                val sender = senderDisplayName.ifBlank { "Nodic member" }
+                val taskId = ev.optString("entityId").ifBlank { payload.optString("id") }
+
+                if (assignee == localIdentity.deviceId) {
+                    postContentNotification(
+                        id = eventId.hashCode(),
+                        channel = CHANNEL_TASKS,
+                        title = "Task Assigned",
+                        body = "$sender assigned you: '$title'",
+                        route = "/board",
+                        channelId = channelId,
+                        eventId = eventId,
+                        taskId = taskId,
+                    )
+                }
+            }
+            "TASK_MUTATED" -> {
+                val status = payload.optString("status")
+                val assignee = payload.optString("assigneeDeviceId")
+                val title = payload.optString("title", "task")
+                val sender = senderDisplayName.ifBlank { "Nodic member" }
+                val taskId = ev.optString("entityId").ifBlank { payload.optString("id") }
+
+                if (status == "DONE") {
+                    postContentNotification(
+                        id = eventId.hashCode(),
+                        channel = CHANNEL_TASKS,
+                        title = "Task Completed",
+                        body = "$sender completed: '$title'",
+                        route = "/board",
+                        channelId = channelId,
+                        eventId = eventId,
+                        taskId = taskId,
+                    )
+                } else if (assignee == localIdentity.deviceId) {
+                    postContentNotification(
+                        id = eventId.hashCode(),
+                        channel = CHANNEL_TASKS,
+                        title = "Task Updated",
+                        body = "$sender updated: '$title'",
+                        route = "/board",
+                        channelId = channelId,
+                        eventId = eventId,
+                        taskId = taskId,
+                    )
+                }
+            }
+            "MEMBER_ADDED", "MEMBER_JOINED" -> {
+                val memberName = payload.optString("displayName", senderDisplayName)
+                postContentNotification(
+                    id = eventId.hashCode(),
+                    channel = CHANNEL_MEMBERSHIP,
+                    title = "New Member",
+                    body = "$memberName joined the channel",
+                    route = "/members",
+                    channelId = channelId,
+                    eventId = eventId,
+                    taskId = null,
+                )
+            }
+        }
     }
 
     override fun onDestroy() {
         liveService = null
+        unregisterNetworkCallback()
         try { store.close() } catch (_: Exception) {}
         executor.shutdownNow()
         super.onDestroy()
@@ -872,10 +1270,12 @@ class NodicSyncService : Service() {
         const val EXTRA_DISPLAY_NAME = "displayName"
         const val EXTRA_DEVICE_ID = "deviceId"
         const val EXTRA_PUBLIC_KEY = "publicKey"
+        const val CHANNEL_FOREGROUND = "nodic_foreground"
+        const val CHANNEL_MESSAGES = "nodic_messages"
+        const val CHANNEL_TASKS = "nodic_tasks"
+        const val CHANNEL_MEMBERSHIP = "nodic_membership"
         private const val SERVICE_TYPE = "_nodic._tcp."
-        private const val CHANNEL_ID = "nodic_sync"
         private const val NOTIFICATION_ID = 4101
-        private const val RECEIPT_NOTIFICATION_ID = 4102
         private const val MAX_FRAME_CHARS = 262_144
 
         @Volatile var currentState = SyncState()
@@ -885,6 +1285,7 @@ class NodicSyncService : Service() {
         fun broadcastProbe(id: String): Boolean = liveService?.sendFrame(id, null) ?: false
         fun broadcastEvent(id: String, eventJson: String): Boolean = liveService?.sendFrame(id, eventJson) ?: false
         fun broadcastBatch(id: String, batchJson: String): Boolean = liveService?.sendBatchFrame(id, batchJson) ?: false
+        fun broadcastSummary(id: String, summaryJson: String): Boolean = liveService?.sendSummaryFrame(id, summaryJson) ?: false
         fun connectToPeer(host: String, port: Int): Boolean = liveService?.initiateHandshakeWithPeer(host, port, null) ?: false
         fun notifyIdentityUpdated() {
             liveService?.reannounceIdentity()

@@ -127,6 +127,25 @@ export const peerFrameSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('SUMMARY'), requestId: z.string(), summary: syncSummarySchema }),
   z.object({ kind: z.literal('EVENT_BATCH'), requestId: z.string(), events: z.array(nodicEventSchema).max(100) }),
   z.object({ kind: z.literal('ACK'), requestId: z.string(), summary: syncSummarySchema }),
+  z.object({
+    kind: z.literal('JOIN_REQUEST'),
+    requestId: z.string(),
+    channelId: z.string().min(1).max(128),
+    invitationId: z.string().min(1).max(128),
+    joinSecret: z.string().min(32).max(512),
+    applicantDeviceId: z.string().min(1).max(128),
+    applicantDisplayName: z.string().min(1).max(80),
+    applicantPublicKey: z.string().min(1).max(2048),
+  }),
+  z.object({
+    kind: z.literal('JOIN_RESPONSE'),
+    requestId: z.string(),
+    channelId: z.string().min(1).max(128),
+    accepted: z.boolean(),
+    reason: z.string().optional(),
+    encryptedChannelKey: z.string().optional(),
+    memberEvent: nodicEventSchema.optional(),
+  }),
   z.object({ kind: z.literal('ERROR'), requestId: z.string().optional(), code: z.string(), message: z.string() }),
 ]);
 export type PeerFrame = z.infer<typeof peerFrameSchema>;
