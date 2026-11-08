@@ -299,9 +299,10 @@ describe('Phase 2: Peer Synchronization Protocol', () => {
 
       const summaryA = await repoA.getSyncSummary(channelId);
 
-      // Node B starts with empty channel
+      // Node B joins the channel first (invite-only membership)
       const repoB = new NodicRepository();
       await repoB.init('Node B');
+      await repoB.joinChannel(channelId, 'Convergence Channel', wsA.channel!.leadDeviceId);
       const summaryB = await repoB.getSyncSummary(channelId);
 
       // Node A reconciles with Node B's empty summary
@@ -319,6 +320,26 @@ describe('Phase 2: Peer Synchronization Protocol', () => {
       const updatedSummaryB = await repoB.getSyncSummary(channelId);
       const diff = reconcileSummaries(summaryA, updatedSummaryB);
       expect(diff.isInSync).toBe(true);
+    });
+
+    it('rejects unsolicited remote CHANNEL_CREATED and channel events on unjoined nodes', async () => {
+      const repoLead = new NodicRepository();
+      await repoLead.init('Lead Node');
+      const { genesisEvent, snapshot: wsLead } = await repoLead.createChannel('Invite Only Room');
+      const channelId = wsLead.channel!.id;
+
+      const repoBystander = new NodicRepository();
+      await repoBystander.init('Connected Bystander');
+
+      const snapAfterUnsolicited = await repoBystander.applyEvent(genesisEvent);
+      expect(snapAfterUnsolicited.channel).toBeNull();
+      const channels = await repoBystander.listChannels();
+      expect(channels.some((c) => c.id === channelId)).toBe(false);
+
+      const rejected = await repoBystander.listRejectedEvents();
+      expect(rejected.some((r) => r.eventId === genesisEvent.id && r.reasonCode === 'NOT_A_MEMBER_OF_CHANNEL')).toBe(
+        true,
+      );
     });
   });
 });

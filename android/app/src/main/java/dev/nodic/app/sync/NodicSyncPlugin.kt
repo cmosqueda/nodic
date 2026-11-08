@@ -153,7 +153,7 @@ class NodicSyncPlugin : Plugin() {
         }
         PhaseZeroStore(context).use { it.upsertWorkspaceEvent(eventJson) }
         val eventId = Regex("\\\"id\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"").find(eventJson)?.groupValues?.get(1) ?: UUID.randomUUID().toString()
-        val accepted = NodicSyncService.broadcastEvent(eventId, eventJson)
+        val accepted = NodicSyncService.broadcastEvent(eventId, eventJson, targetSet(call))
         call.resolve(JSObject().put("accepted", accepted).put("eventId", eventId))
     }
 
@@ -174,7 +174,7 @@ class NodicSyncPlugin : Plugin() {
             }
         } catch (_: Exception) {}
         val id = UUID.randomUUID().toString()
-        val accepted = NodicSyncService.broadcastBatch(id, batchJson)
+        val accepted = NodicSyncService.broadcastBatch(id, batchJson, targetSet(call))
         call.resolve(JSObject().put("accepted", accepted).put("batchId", id))
     }
 
@@ -260,7 +260,7 @@ class NodicSyncPlugin : Plugin() {
             return
         }
         val id = UUID.randomUUID().toString()
-        val accepted = NodicSyncService.broadcastSummary(id, summaryJson)
+        val accepted = NodicSyncService.broadcastSummary(id, summaryJson, targetSet(call))
         call.resolve(JSObject().put("accepted", accepted))
     }
 
@@ -351,9 +351,95 @@ class NodicSyncPlugin : Plugin() {
     fun disconnectPeerLocally(call: PluginCall) {
         val peerDeviceId = call.getString("peerDeviceId")?.trim()
         if (!peerDeviceId.isNullOrBlank()) {
+            PhaseZeroStore(context).use { it.setPairingState(peerDeviceId, "DISCONNECTED_LOCAL") }
             NodicSyncService.disconnectPeerLocally(peerDeviceId)
         }
         call.resolve(JSObject().put("disconnected", true))
+    }
+
+    @PluginMethod
+    fun savePairedDevice(call: PluginCall) {
+        val deviceId = call.getString("deviceId")
+        val state = call.getString("pairingState")
+        if (deviceId.isNullOrBlank() || state.isNullOrBlank()) {
+            call.reject("deviceId and pairingState are required", "INVALID_PAIRING")
+            return
+        }
+        PhaseZeroStore(context).use { store ->
+            store.upsertPairedDevice(
+                deviceId = deviceId,
+                nodicId = call.getString("nodicId") ?: "nodic-${deviceId.take(8).lowercase()}",
+                displayName = call.getString("displayName") ?: "Node-${deviceId.take(4).uppercase()}",
+                publicKey = call.getString("publicSigningKey") ?: "p256-peer-key",
+                host = call.getString("host") ?: "0.0.0.0",
+                port = call.getInt("port") ?: 0,
+                pairingState = state,
+                pairedAt = (call.getLong("pairedAt") ?: System.currentTimeMillis()),
+                updatedAt = (call.getLong("updatedAt") ?: System.currentTimeMillis()),
+            )
+        }
+        // A device that is no longer PAIRED must stop receiving sync traffic immediately
+        if (state != "PAIRED") NodicSyncService.disconnectPeerLocally(deviceId)
+        call.resolve(JSObject().put("saved", true))
+    }
+
+    @PluginMethod
+    fun savePairingRequest(call: PluginCall) {
+        val requestId = call.getString("requestId")
+        val fromDeviceId = call.getString("fromDeviceId")
+        if (requestId.isNullOrBlank() || fromDeviceId.isNullOrBlank()) {
+            call.reject("requestId and fromDeviceId are required", "INVALID_PAIRING")
+            return
+        }
+        PhaseZeroStore(context).use { store ->
+            store.upsertPairingRequest(
+                requestId = requestId,
+                fromDeviceId = fromDeviceId,
+                fromNodicId = call.getString("fromNodicId") ?: "nodic-${fromDeviceId.take(8).lowercase()}",
+                fromDisplayName = call.getString("fromDisplayName") ?: "Node-${fromDeviceId.take(4).uppercase()}",
+                fromPublicKey = call.getString("fromPublicKey") ?: "p256-peer-key",
+                host = call.getString("host") ?: "0.0.0.0",
+                port = call.getInt("port") ?: 0,
+                direction = call.getString("direction") ?: "INBOUND",
+                status = call.getString("status") ?: "PENDING",
+                createdAt = (call.getLong("createdAt") ?: System.currentTimeMillis()),
+            )
+        }
+        call.resolve(JSObject().put("saved", true))
+    }
+
+    @PluginMethod
+    fun getPairingState(call: PluginCall) {
+        PhaseZeroStore(context).use { store ->
+            call.resolve(
+                JSObject()
+                    .put("pairedDevices", jsonArrayToJsArray(store.getPairedDevices()))
+                    .put("pairingRequests", jsonArrayToJsArray(store.getPairingRequests())),
+            )
+        }
+    }
+
+    @PluginMethod
+    fun secureSet(call: PluginCall) {
+        val key = call.getString("key")
+        val value = call.getString("value")
+        if (key.isNullOrBlank() || value == null) {
+            call.reject("key and value are required", "INVALID_ARGS")
+            return
+        }
+        PhaseZeroStore(context).use { it.secureSet(key, value) }
+        call.resolve(JSObject().put("saved", true))
+    }
+
+    @PluginMethod
+    fun secureGet(call: PluginCall) {
+        val key = call.getString("key")
+        if (key.isNullOrBlank()) {
+            call.reject("key is required", "INVALID_ARGS")
+            return
+        }
+        val value = PhaseZeroStore(context).use { it.secureGet(key) }
+        call.resolve(JSObject().put("value", value ?: JSObject.NULL))
     }
 
     @PluginMethod
@@ -407,6 +493,14 @@ class NodicSyncPlugin : Plugin() {
                 .put("deviceId", deviceId)
                 .put("details", details),
         )
+    }
+
+    /** Optional targetDeviceIds restricts delivery to specific (paired) channel members. */
+    private fun targetSet(call: PluginCall): Set<String>? {
+        val arr = call.getArray("targetDeviceIds") ?: return null
+        val out = HashSet<String>()
+        for (i in 0 until arr.length()) arr.optString(i)?.takeIf { it.isNotBlank() }?.let { out.add(it) }
+        return out
     }
 
     private fun jsonArrayToJsArray(arr: JSONArray): JSArray {

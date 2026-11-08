@@ -194,19 +194,21 @@ class NodicSyncService : Service() {
         }
     }
 
+    /** Only devices with an accepted pairing are ever auto-connected on startup. */
     private fun hydrateKnownPeersFromStore() {
         try {
             val localIdentity = store.getOrCreateLocalIdentity()
-            val savedPeers = store.getPeerIdentities()
+            val savedPeers = store.getPairedDevices(onlyPaired = true)
             for (i in 0 until savedPeers.length()) {
                 val p = savedPeers.optJSONObject(i) ?: continue
                 val peerDeviceId = p.optString("deviceId")
                 val host = cleanHostAddress(p.optString("host")) ?: continue
                 val port = p.optInt("port", 0)
                 if (peerDeviceId.isBlank() || peerDeviceId == localIdentity.deviceId || port <= 0) continue
+                if (locallyDisconnectedPeers.contains(peerDeviceId)) continue
                 val displayName = p.optString("displayName", "Node-${peerDeviceId.take(4)}")
                 val pubKey = p.optString("publicSigningKey", "p256-peer-key")
-                val srvName = p.optString("serviceName", "nodic-${peerDeviceId.take(8)}")
+                val srvName = p.optString("nodicId").ifBlank { "nodic-${peerDeviceId.take(8)}" }
                 if (!connectedPeers.containsKey(peerDeviceId)) {
                     connectedPeers[peerDeviceId] = ConnectedPeerEndpoint(
                         deviceId = peerDeviceId,
@@ -254,7 +256,8 @@ class NodicSyncService : Service() {
             val authorId = ev.optString("authorDeviceId").ifBlank { fallbackSenderId }
             val wasAlreadyStored = store.hasWorkspaceEvent(evId)
             val evStr = ev.toString()
-            store.upsertWorkspaceEvent(evStr)
+            // Drop events for channels this device never joined (pairing != membership)
+            if (!store.upsertRemoteWorkspaceEvent(evStr)) continue
             NodicSyncPlugin.emitReceived(evId, authorId, nowIso, evStr)
             if (!wasAlreadyStored && authorId != localIdentity.deviceId) {
                 try {
@@ -315,6 +318,38 @@ class NodicSyncService : Service() {
                         ?: "p256-peer-key"
                     val remoteServiceName = frame.optString("serviceName").takeIf { it.isNotBlank() }
                         ?: "nodic-${remoteDeviceId.take(8)}"
+
+                    // Bluetooth-style gate: only accepted pairings may open a sync session.
+                    // Everyone else is merely "discovered nearby" (identity exchange only).
+                    val pairedWithRemote = store.isPaired(remoteDeviceId) &&
+                        !locallyDisconnectedPeers.contains(remoteDeviceId)
+                    if (!pairedWithRemote) {
+                        val discoveredPort = frame.optInt("listenPort", 0).takeIf { it > 0 } ?: 8443
+                        val discoveredJson = store.upsertPeerIdentity(
+                            deviceId = remoteDeviceId,
+                            displayName = remoteDisplayName,
+                            publicKey = remotePublicKey,
+                            serviceName = remoteServiceName,
+                            host = remoteHost,
+                            port = discoveredPort,
+                            status = "ONLINE",
+                        )
+                        val discoveryAck = JSONObject()
+                            .put("kind", "HELLO_ACK")
+                            .put("id", sessionId)
+                            .put("sessionId", sessionId)
+                            .put("protocolVersion", 1)
+                            .put("deviceId", localIdentity.deviceId)
+                            .put("displayName", localIdentity.displayName)
+                            .put("publicKey", localIdentity.publicKey)
+                            .put("serviceName", serviceName)
+                            .put("listenPort", listenPort)
+                            .put("discoveryOnly", true)
+                            .put("sentAt", Instant.now().toString())
+                        PrintWriter(client.getOutputStream(), true).println(discoveryAck.toString())
+                        NodicSyncPlugin.emitPeerIdentity(discoveredJson)
+                        return
+                    }
 
                     val existingPeer = connectedPeers[remoteDeviceId]
                     val nsdPort = nsdPeers.values.firstOrNull {
@@ -385,7 +420,6 @@ class NodicSyncService : Service() {
                         .put("serviceName", serviceName)
                         .put("listenPort", listenPort)
                         .put("sentAt", Instant.now().toString())
-                        .put("events", store.getWorkspaceEvents(null, 200))
                     PrintWriter(client.getOutputStream(), true).println(ack.toString())
 
                     NodicSyncPlugin.emitPeerIdentity(peerIdentityJson)
@@ -420,6 +454,30 @@ class NodicSyncService : Service() {
                         status = "ONLINE",
                     )
                     NodicSyncPlugin.emitPeerIdentity(peerIdentityJson)
+
+                    // Persist the pending request natively so it survives app kills
+                    store.upsertPairingRequest(
+                        requestId = requestId,
+                        fromDeviceId = remoteDeviceId,
+                        fromNodicId = remoteNodicId,
+                        fromDisplayName = remoteDisplayName,
+                        fromPublicKey = remotePublicKey,
+                        host = remoteHost,
+                        port = remoteListenPort,
+                        direction = "INBOUND",
+                        status = "PENDING",
+                    )
+                    if (!store.isPaired(remoteDeviceId)) {
+                        store.upsertPairedDevice(
+                            deviceId = remoteDeviceId,
+                            nodicId = remoteNodicId,
+                            displayName = remoteDisplayName,
+                            publicKey = remotePublicKey,
+                            host = remoteHost,
+                            port = remoteListenPort,
+                            pairingState = "PENDING_INBOUND",
+                        )
+                    }
 
                     val reqJson = JSONObject()
                         .put("requestId", requestId)
@@ -472,6 +530,23 @@ class NodicSyncService : Service() {
                     val accepted = frame.optBoolean("accepted", false)
                     val sentAt = frame.optString("sentAt", Instant.now().toString())
 
+                    // Only honour responses to a request this device actually sent to that peer
+                    val sentRequest = store.getPairingRequest(requestId)
+                    val validOutbound = sentRequest != null &&
+                        sentRequest.optString("direction") == "OUTBOUND" &&
+                        sentRequest.optString("fromDeviceId") == remoteDeviceId
+                    if (!validOutbound) return
+                    store.setPairingRequestStatus(requestId, if (accepted) "ACCEPTED" else "DECLINED")
+                    store.upsertPairedDevice(
+                        deviceId = remoteDeviceId,
+                        nodicId = remoteNodicId,
+                        displayName = remoteDisplayName,
+                        publicKey = remotePublicKey,
+                        host = remoteHost,
+                        port = remoteListenPort,
+                        pairingState = if (accepted) "PAIRED" else "DECLINED",
+                    )
+
                     if (accepted) {
                         locallyDisconnectedPeers.remove(remoteDeviceId)
                         connectedPeers[remoteDeviceId] = ConnectedPeerEndpoint(
@@ -518,7 +593,6 @@ class NodicSyncService : Service() {
                         .put("displayName", localIdentity.displayName)
                         .put("publicKey", localIdentity.publicKey)
                         .put("listenPort", listenPort)
-                        .put("events", store.getWorkspaceEvents(null, 200))
                     PrintWriter(client.getOutputStream(), true).println(ack.toString())
                     return
                 }
@@ -528,6 +602,13 @@ class NodicSyncService : Service() {
                 val sentAt = frame.optString("sentAt", Instant.now().toString())
                 val from = frame.optString("from", remoteHost)
                 val senderDeviceId = frame.optString("deviceId").takeIf { it.isNotBlank() } ?: from
+                // Sync traffic is accepted only from devices with an accepted pairing
+                if (senderDeviceId == localIdentity.deviceId ||
+                    !store.isPaired(senderDeviceId) ||
+                    locallyDisconnectedPeers.contains(senderDeviceId)
+                ) {
+                    return
+                }
                 val senderDisplayName = frame.optString("displayName").takeIf { it.isNotBlank() }
                     ?: connectedPeers[senderDeviceId]?.displayName
                     ?: from
@@ -580,12 +661,12 @@ class NodicSyncService : Service() {
                 } else if (kind == "EVENT_BATCH") {
                     val batchArray = frame.optJSONArray("events")
                     if (batchArray != null) {
-                        receivedEventCount = batchArray.length()
                         for (i in 0 until batchArray.length()) {
                             val ev = batchArray.getJSONObject(i)
                             val evId = ev.optString("id", UUID.randomUUID().toString())
                             val evStr = ev.toString()
-                            store.upsertWorkspaceEvent(evStr)
+                            if (!store.upsertRemoteWorkspaceEvent(evStr)) continue
+                            receivedEventCount++
                             NodicSyncPlugin.emitReceived(evId, senderDeviceId, sentAt, evStr)
                             processReceivedEventForNotification(ev, senderDisplayName)
                         }
@@ -611,14 +692,12 @@ class NodicSyncService : Service() {
                     NodicSyncPlugin.emitReceived(id, senderDeviceId, sentAt, eventJson ?: frame.toString())
                 } else {
                     val eventJson = frame.optString("eventJson").takeIf { it.isNotBlank() }
-                    receivedEventCount = if (eventJson != null) 1 else 0
-                    if (eventJson != null) {
-                        store.upsertWorkspaceEvent(eventJson)
-                    }
-                    NodicSyncPlugin.emitReceived(id, senderDeviceId, sentAt, eventJson)
-                    if (eventJson != null) {
+                    val stored = eventJson != null && store.upsertRemoteWorkspaceEvent(eventJson)
+                    receivedEventCount = if (stored) 1 else 0
+                    if (stored) {
+                        NodicSyncPlugin.emitReceived(id, senderDeviceId, sentAt, eventJson)
                         try {
-                            processReceivedEventForNotification(JSONObject(eventJson), senderDisplayName)
+                            processReceivedEventForNotification(JSONObject(eventJson!!), senderDisplayName)
                         } catch (_: Exception) {}
                     }
                 }
@@ -662,7 +741,6 @@ class NodicSyncService : Service() {
                     .put("displayName", localIdentity.displayName)
                     .put("publicKey", localIdentity.publicKey)
                     .put("listenPort", listenPort)
-                    .put("events", store.getWorkspaceEvents(null, 200))
                 PrintWriter(client.getOutputStream(), true).println(ackFrame.toString())
 
                 updateState(
@@ -725,6 +803,26 @@ class NodicSyncService : Service() {
                     ?: "nodic-${remoteDeviceId.take(8)}"
                 val remotePort = reply.optInt("listenPort", port).takeIf { it > 0 } ?: port
                 val agreedSessionId = reply.optString("sessionId").takeIf { it.isNotBlank() } ?: sessionId
+
+                // Discovery-only: the peer is nearby but not (mutually) paired, so record
+                // its identity for the "Nearby Devices" list without opening a sync session.
+                val sessionAllowed = !reply.optBoolean("discoveryOnly", false) &&
+                    store.isPaired(remoteDeviceId) &&
+                    !locallyDisconnectedPeers.contains(remoteDeviceId)
+                if (!sessionAllowed) {
+                    val nearbyJson = store.upsertPeerIdentity(
+                        deviceId = remoteDeviceId,
+                        displayName = remoteDisplayName,
+                        publicKey = remotePublicKey,
+                        serviceName = remoteServiceName,
+                        host = host,
+                        port = remotePort,
+                        status = "ONLINE",
+                    )
+                    NodicSyncPlugin.emitPeerIdentity(nearbyJson)
+                    updatePeerState()
+                    return false
+                }
 
                 val endpoint = ConnectedPeerEndpoint(
                     deviceId = remoteDeviceId,
@@ -820,6 +918,20 @@ class NodicSyncService : Service() {
     private fun sendPairingResponseFrame(host: String, port: Int, requestId: String, accepted: Boolean): Boolean {
         val localIdentity = store.getOrCreateLocalIdentity()
         val localNodicId = "nodic-${localIdentity.deviceId.take(8).lowercase()}"
+        // Only answer requests that this device actually received
+        val inbound = store.getPairingRequest(requestId)
+        if (inbound == null || inbound.optString("direction") != "INBOUND") return false
+        store.setPairingRequestStatus(requestId, if (accepted) "ACCEPTED" else "DECLINED")
+        store.upsertPairedDevice(
+            deviceId = inbound.optString("fromDeviceId"),
+            nodicId = inbound.optString("fromNodicId"),
+            displayName = inbound.optString("fromDisplayName"),
+            publicKey = inbound.optString("fromPublicKey"),
+            host = inbound.optString("host"),
+            port = inbound.optInt("port"),
+            pairingState = if (accepted) "PAIRED" else "DECLINED",
+        )
+        if (accepted) locallyDisconnectedPeers.remove(inbound.optString("fromDeviceId"))
         return try {
             Socket().use { socket ->
                 socket.connect(InetSocketAddress(host, port), 3_500)
@@ -834,9 +946,6 @@ class NodicSyncService : Service() {
                     .put("listenPort", listenPort)
                     .put("accepted", accepted)
                     .put("sentAt", Instant.now().toString())
-                if (accepted) {
-                    frame.put("events", store.getWorkspaceEvents(null, 200))
-                }
                 PrintWriter(socket.getOutputStream(), true).println(frame.toString())
                 val ackLine = BufferedReader(InputStreamReader(socket.getInputStream())).readLine()
                 if (accepted && ackLine != null) {
@@ -871,37 +980,22 @@ class NodicSyncService : Service() {
         updatePeerState()
     }
 
-    private fun collectTargetEndpoints(): List<ConnectedPeerEndpoint> {
+    private fun collectTargetEndpoints(allowedDeviceIds: Set<String>? = null): List<ConnectedPeerEndpoint> {
         val targets = LinkedHashMap<String, ConnectedPeerEndpoint>()
+        // Only accepted pairings are ever targeted; merely discovered (NSD) devices are not.
         for (peer in connectedPeers.values) {
             if (locallyDisconnectedPeers.contains(peer.deviceId)) continue
+            if (allowedDeviceIds != null && !allowedDeviceIds.contains(peer.deviceId)) continue
+            if (!store.isPaired(peer.deviceId)) continue
             val host = cleanHostAddress(peer.host) ?: continue
             if (peer.port <= 0) continue
             targets["$host:${peer.port}"] = peer.copy(host = host)
         }
-        for ((name, info) in nsdPeers.entries) {
-            if (locallyDisconnectedPeers.any { name.endsWith(it.take(8), ignoreCase = true) || it == name }) continue
-            val host = cleanHostAddress(info.host?.hostAddress) ?: continue
-            if (info.port <= 0) continue
-            val key = "$host:${info.port}"
-            if (!targets.containsKey(key)) {
-                targets[key] = ConnectedPeerEndpoint(
-                    deviceId = name,
-                    displayName = name,
-                    publicKey = "p256-peer-key",
-                    serviceName = name,
-                    host = host,
-                    port = info.port,
-                    sessionId = UUID.randomUUID().toString(),
-                    direction = "OUTBOUND",
-                )
-            }
-        }
         return targets.values.toList()
     }
 
-    private fun sendFrame(id: String, eventJson: String?): Boolean {
-        val snapshot = collectTargetEndpoints()
+    private fun sendFrame(id: String, eventJson: String?, targets: Set<String>? = null): Boolean {
+        val snapshot = collectTargetEndpoints(targets)
         if (snapshot.isEmpty()) {
             val logJson = store.insertLog(
                 level = "WARN",
@@ -1006,8 +1100,8 @@ class NodicSyncService : Service() {
         return true
     }
 
-    private fun sendBatchFrame(id: String, batchJson: String): Boolean {
-        val snapshot = collectTargetEndpoints()
+    private fun sendBatchFrame(id: String, batchJson: String, targets: Set<String>? = null): Boolean {
+        val snapshot = collectTargetEndpoints(targets)
         if (snapshot.isEmpty()) return false
         val localIdentity = store.getOrCreateLocalIdentity()
         val eventsArray = JSONArray(batchJson)
@@ -1084,8 +1178,8 @@ class NodicSyncService : Service() {
         return true
     }
 
-    private fun sendSummaryFrame(id: String, summaryJson: String): Boolean {
-        val snapshot = collectTargetEndpoints()
+    private fun sendSummaryFrame(id: String, summaryJson: String, targets: Set<String>? = null): Boolean {
+        val snapshot = collectTargetEndpoints(targets)
         if (snapshot.isEmpty()) return false
         val localIdentity = store.getOrCreateLocalIdentity()
         val summaryObj = JSONObject(summaryJson)
@@ -1630,9 +1724,12 @@ class NodicSyncService : Service() {
         @Volatile private var liveService: NodicSyncService? = null
 
         fun broadcastProbe(id: String): Boolean = liveService?.sendFrame(id, null) ?: false
-        fun broadcastEvent(id: String, eventJson: String): Boolean = liveService?.sendFrame(id, eventJson) ?: false
-        fun broadcastBatch(id: String, batchJson: String): Boolean = liveService?.sendBatchFrame(id, batchJson) ?: false
-        fun broadcastSummary(id: String, summaryJson: String): Boolean = liveService?.sendSummaryFrame(id, summaryJson) ?: false
+        fun broadcastEvent(id: String, eventJson: String, targets: Set<String>? = null): Boolean =
+            liveService?.sendFrame(id, eventJson, targets) ?: false
+        fun broadcastBatch(id: String, batchJson: String, targets: Set<String>? = null): Boolean =
+            liveService?.sendBatchFrame(id, batchJson, targets) ?: false
+        fun broadcastSummary(id: String, summaryJson: String, targets: Set<String>? = null): Boolean =
+            liveService?.sendSummaryFrame(id, summaryJson, targets) ?: false
         fun connectToPeer(host: String, port: Int): Boolean = liveService?.initiateHandshakeWithPeer(host, port, null) ?: false
         fun sendPairingRequest(host: String, port: Int, requestId: String): Boolean =
             liveService?.sendPairingRequestFrame(host, port, requestId) ?: false

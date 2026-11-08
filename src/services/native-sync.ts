@@ -1,5 +1,13 @@
 import { Capacitor, registerPlugin, type PluginListenerHandle } from '@capacitor/core';
-import type { NodicEvent, PeerIdentity, PeerSession, SyncLog, SyncStatus } from '../../protocol/contracts';
+import type {
+  NodicEvent,
+  PairedDevice,
+  PairingRequest,
+  PeerIdentity,
+  PeerSession,
+  SyncLog,
+  SyncStatus,
+} from '../../protocol/contracts';
 
 export interface ProbeResult {
   pluginReady: boolean;
@@ -54,13 +62,53 @@ export interface NativeWorkspaceBackup {
   events: NodicEvent[];
 }
 
+export interface NativePairingState {
+  pairedDevices: PairedDevice[];
+  pairingRequests: PairingRequest[];
+}
+
 interface NodicSyncPlugin {
   getStatus(): Promise<SyncStatus>;
   start(options: { displayName: string; deviceId?: string; publicKey?: string }): Promise<SyncStatus>;
   stop(): Promise<SyncStatus>;
-  publishEvent(options: { eventJson: string }): Promise<{ accepted: boolean; eventId: string }>;
-  publishBatch(options: { batchJson: string }): Promise<{ accepted: boolean; batchId: string }>;
-  publishSummary(options: { summaryJson: string }): Promise<{ accepted: boolean }>;
+  publishEvent(options: {
+    eventJson: string;
+    targetDeviceIds?: string[];
+  }): Promise<{ accepted: boolean; eventId: string }>;
+  publishBatch(options: {
+    batchJson: string;
+    targetDeviceIds?: string[];
+  }): Promise<{ accepted: boolean; batchId: string }>;
+  publishSummary(options: {
+    summaryJson: string;
+    targetDeviceIds?: string[];
+  }): Promise<{ accepted: boolean }>;
+  savePairedDevice(options: {
+    deviceId: string;
+    nodicId: string;
+    displayName: string;
+    publicSigningKey: string;
+    host: string;
+    port: number;
+    pairingState: string;
+    pairedAt: number;
+    updatedAt: number;
+  }): Promise<{ saved: boolean }>;
+  savePairingRequest(options: {
+    requestId: string;
+    fromDeviceId: string;
+    fromNodicId: string;
+    fromDisplayName: string;
+    fromPublicKey: string;
+    host: string;
+    port: number;
+    direction: string;
+    status: string;
+    createdAt: number;
+  }): Promise<{ saved: boolean }>;
+  getPairingState(): Promise<NativePairingState>;
+  secureSet(options: { key: string; value: string }): Promise<{ saved: boolean }>;
+  secureGet(options: { key: string }): Promise<{ value: string | null }>;
   saveWorkspaceChannel(options: {
     id: string;
     sessionId: string;
@@ -275,6 +323,79 @@ export const nativeSync = {
     return { disconnected: true };
   },
 
+  async savePairedDevice(device: PairedDevice): Promise<void> {
+    if (!Capacitor.isNativePlatform()) return;
+    try {
+      await nativePlugin.savePairedDevice({
+        deviceId: device.deviceId,
+        nodicId: device.nodicId,
+        displayName: device.displayName,
+        publicSigningKey: device.publicSigningKey,
+        host: device.host,
+        port: device.port,
+        pairingState: device.pairingState,
+        pairedAt: new Date(device.pairedAt).getTime() || Date.now(),
+        updatedAt: new Date(device.updatedAt).getTime() || Date.now(),
+      });
+    } catch (err) {
+      console.warn('Failed to mirror paired device to native store:', err);
+    }
+  },
+
+  async savePairingRequest(req: PairingRequest): Promise<void> {
+    if (!Capacitor.isNativePlatform()) return;
+    try {
+      await nativePlugin.savePairingRequest({
+        requestId: req.requestId,
+        fromDeviceId: req.fromDeviceId,
+        fromNodicId: req.fromNodicId,
+        fromDisplayName: req.fromDisplayName,
+        fromPublicKey: req.fromPublicKey,
+        host: req.host,
+        port: req.port,
+        direction: req.direction,
+        status: req.status,
+        createdAt: new Date(req.createdAt).getTime() || Date.now(),
+      });
+    } catch (err) {
+      console.warn('Failed to mirror pairing request to native store:', err);
+    }
+  },
+
+  async getPairingState(): Promise<NativePairingState> {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        const res = await nativePlugin.getPairingState();
+        return {
+          pairedDevices: res?.pairedDevices ?? [],
+          pairingRequests: res?.pairingRequests ?? [],
+        };
+      } catch {
+        // fall through
+      }
+    }
+    return { pairedDevices: [], pairingRequests: [] };
+  },
+
+  async secureSet(key: string, value: string): Promise<void> {
+    if (!Capacitor.isNativePlatform()) return;
+    try {
+      await nativePlugin.secureSet({ key, value });
+    } catch (err) {
+      console.warn('Failed to persist secret to native secure store:', err);
+    }
+  },
+
+  async secureGet(key: string): Promise<string | null> {
+    if (!Capacitor.isNativePlatform()) return null;
+    try {
+      const res = await nativePlugin.secureGet({ key });
+      return res?.value ?? null;
+    } catch {
+      return null;
+    }
+  },
+
   async getDiagnostics(): Promise<NativeDiagnosticsSnapshot> {
     if (Capacitor.isNativePlatform()) {
       return nativePlugin.getDiagnostics();
@@ -293,16 +414,26 @@ export const nativeSync = {
     return { cleared: true };
   },
 
-  async publishEvent(event: NodicEvent): Promise<{ accepted: boolean; eventId: string }> {
+  /**
+   * Publish to paired peers. `targetDeviceIds` restricts delivery (e.g. to a channel's members);
+   * an empty list delivers to nobody.
+   */
+  async publishEvent(
+    event: NodicEvent,
+    targetDeviceIds?: string[],
+  ): Promise<{ accepted: boolean; eventId: string }> {
     if (Capacitor.isNativePlatform()) {
-      return nativePlugin.publishEvent({ eventJson: JSON.stringify(event) });
+      return nativePlugin.publishEvent({ eventJson: JSON.stringify(event), targetDeviceIds });
     }
     return { accepted: true, eventId: event.id };
   },
 
-  async publishBatch(events: NodicEvent[]): Promise<{ accepted: boolean; batchId: string }> {
+  async publishBatch(
+    events: NodicEvent[],
+    targetDeviceIds?: string[],
+  ): Promise<{ accepted: boolean; batchId: string }> {
     if (Capacitor.isNativePlatform()) {
-      return nativePlugin.publishBatch({ batchJson: JSON.stringify(events) });
+      return nativePlugin.publishBatch({ batchJson: JSON.stringify(events), targetDeviceIds });
     }
     return { accepted: true, batchId: crypto.randomUUID() };
   },
@@ -310,10 +441,12 @@ export const nativeSync = {
   async publishSummary(
     channelId: string,
     sequences: Record<string, number>,
+    targetDeviceIds?: string[],
   ): Promise<{ accepted: boolean }> {
     if (Capacitor.isNativePlatform()) {
       return nativePlugin.publishSummary({
         summaryJson: JSON.stringify({ channelId, sequences }),
+        targetDeviceIds,
       });
     }
     return { accepted: true };

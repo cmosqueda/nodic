@@ -525,5 +525,28 @@ describe('Two-Peer Identity, Session, Log & Event Synchronization', () => {
       accepted: true,
     });
     expect(reconnectedOnA.pairingState).toBe('PAIRED');
+
+    // 6. Invite-only channel scoping: creating a channel on User A does NOT add paired User B or User C
+    const { snapshot: chSnapA } = await repoA.createChannel('Alpha Squad', 'Invite-only mesh room');
+    const alphaChannelId = chSnapA.channel!.id;
+    expect(repoA.getChannelRecipientIds(alphaChannelId)).toEqual([]);
+
+    // User B joins via invite code using JOIN_REQUESTED handshake; User C remains outside the channel
+    const { parseInvitationCode } = await import('../src/domain/invitations/invitation-codec');
+    const codeForB = await repoA.createInvitation(alphaChannelId, 24);
+    const parsedForB = parseInvitationCode(codeForB);
+    expect(parsedForB.success).toBe(true);
+    if (!parsedForB.success) return;
+
+    const joinReqFromB = await repoB.buildJoinRequestEvent(alphaChannelId, {
+      invitationId: parsedForB.invitation.invitationId,
+      joinSecret: parsedForB.invitation.joinSecret,
+    });
+    const joinOutcome = await repoA.handleIncomingJoinRequest(joinReqFromB);
+    expect(joinOutcome.accepted).toBe(true);
+    expect(joinOutcome.memberEvent?.type).toBe('MEMBER_ADDED');
+
+    // Only admitted member B is in channel recipients; paired peer C is excluded
+    expect(repoA.getChannelRecipientIds(alphaChannelId)).toEqual([idB.deviceId]);
   });
 });

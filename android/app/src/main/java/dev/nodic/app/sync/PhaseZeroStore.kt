@@ -130,6 +130,266 @@ class PhaseZeroStore(private val appContext: Context) : SQLiteOpenHelper(appCont
             )
             """.trimIndent(),
         )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS paired_devices (
+                device_id TEXT PRIMARY KEY NOT NULL,
+                nodic_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                public_signing_key TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                pairing_state TEXT NOT NULL,
+                paired_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS pairing_requests (
+                request_id TEXT PRIMARY KEY NOT NULL,
+                from_device_id TEXT NOT NULL,
+                from_nodic_id TEXT NOT NULL,
+                from_display_name TEXT NOT NULL,
+                from_public_key TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS secure_kv (
+                k TEXT PRIMARY KEY NOT NULL,
+                v TEXT NOT NULL
+            )
+            """.trimIndent(),
+        )
+    }
+
+    // ---- Pairing persistence (paired_devices / pairing_requests) ----
+
+    @Synchronized
+    fun upsertPairedDevice(
+        deviceId: String,
+        nodicId: String,
+        displayName: String,
+        publicKey: String,
+        host: String,
+        port: Int,
+        pairingState: String,
+        pairedAt: Long = System.currentTimeMillis(),
+        updatedAt: Long = System.currentTimeMillis(),
+    ) {
+        val db = writableDatabase
+        createTables(db)
+        db.execSQL(
+            """
+            INSERT INTO paired_devices (device_id, nodic_id, display_name, public_signing_key, host, port, pairing_state, paired_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+                nodic_id = excluded.nodic_id,
+                display_name = excluded.display_name,
+                public_signing_key = excluded.public_signing_key,
+                host = excluded.host,
+                port = excluded.port,
+                pairing_state = excluded.pairing_state,
+                updated_at = excluded.updated_at
+            """.trimIndent(),
+            arrayOf<Any>(deviceId, nodicId, displayName, publicKey, host, port, pairingState, pairedAt, updatedAt),
+        )
+    }
+
+    @Synchronized
+    fun setPairingState(deviceId: String, pairingState: String) {
+        val db = writableDatabase
+        createTables(db)
+        db.execSQL(
+            "UPDATE paired_devices SET pairing_state = ?, updated_at = ? WHERE device_id = ?",
+            arrayOf<Any>(pairingState, System.currentTimeMillis(), deviceId),
+        )
+    }
+
+    @Synchronized
+    fun isPaired(deviceId: String): Boolean {
+        val db = writableDatabase
+        createTables(db)
+        db.rawQuery(
+            "SELECT 1 FROM paired_devices WHERE device_id = ? AND pairing_state = 'PAIRED' LIMIT 1",
+            arrayOf(deviceId),
+        ).use { return it.moveToFirst() }
+    }
+
+    /** Matches an NSD service name (nodic-<first 8 of device id>) against accepted pairings. */
+    @Synchronized
+    fun isPairedByServiceName(serviceName: String): Boolean {
+        val db = writableDatabase
+        createTables(db)
+        db.rawQuery(
+            "SELECT 1 FROM paired_devices WHERE pairing_state = 'PAIRED' AND (nodic_id = ? OR 'nodic-' || lower(substr(device_id, 1, 8)) = lower(?)) LIMIT 1",
+            arrayOf(serviceName, serviceName),
+        ).use { return it.moveToFirst() }
+    }
+
+    @Synchronized
+    fun getPairedDevices(onlyPaired: Boolean = false): JSONArray {
+        val db = writableDatabase
+        createTables(db)
+        val arr = JSONArray()
+        val sql = "SELECT device_id, nodic_id, display_name, public_signing_key, host, port, pairing_state, paired_at, updated_at FROM paired_devices" +
+            (if (onlyPaired) " WHERE pairing_state = 'PAIRED'" else "") + " ORDER BY updated_at DESC"
+        db.rawQuery(sql, null).use { c ->
+            while (c.moveToNext()) {
+                arr.put(
+                    JSONObject()
+                        .put("deviceId", c.getString(0))
+                        .put("nodicId", c.getString(1))
+                        .put("displayName", c.getString(2))
+                        .put("publicSigningKey", c.getString(3))
+                        .put("host", c.getString(4))
+                        .put("port", c.getInt(5))
+                        .put("pairingState", c.getString(6))
+                        .put("pairedAt", Instant.ofEpochMilli(c.getLong(7)).toString())
+                        .put("updatedAt", Instant.ofEpochMilli(c.getLong(8)).toString()),
+                )
+            }
+        }
+        return arr
+    }
+
+    @Synchronized
+    fun upsertPairingRequest(
+        requestId: String,
+        fromDeviceId: String,
+        fromNodicId: String,
+        fromDisplayName: String,
+        fromPublicKey: String,
+        host: String,
+        port: Int,
+        direction: String,
+        status: String,
+        createdAt: Long = System.currentTimeMillis(),
+    ) {
+        val db = writableDatabase
+        createTables(db)
+        db.execSQL(
+            """
+            INSERT INTO pairing_requests (request_id, from_device_id, from_nodic_id, from_display_name, from_public_key, host, port, direction, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(request_id) DO UPDATE SET
+                status = excluded.status,
+                host = excluded.host,
+                port = excluded.port,
+                from_display_name = excluded.from_display_name
+            """.trimIndent(),
+            arrayOf<Any>(requestId, fromDeviceId, fromNodicId, fromDisplayName, fromPublicKey, host, port, direction, status, createdAt),
+        )
+    }
+
+    @Synchronized
+    fun setPairingRequestStatus(requestId: String, status: String) {
+        val db = writableDatabase
+        createTables(db)
+        db.execSQL("UPDATE pairing_requests SET status = ? WHERE request_id = ?", arrayOf<Any>(status, requestId))
+    }
+
+    @Synchronized
+    fun getPairingRequest(requestId: String): JSONObject? {
+        val db = writableDatabase
+        createTables(db)
+        db.rawQuery(
+            "SELECT request_id, from_device_id, from_nodic_id, from_display_name, from_public_key, host, port, direction, status, created_at FROM pairing_requests WHERE request_id = ?",
+            arrayOf(requestId),
+        ).use { c ->
+            if (!c.moveToFirst()) return null
+            return pairingRequestRow(c)
+        }
+    }
+
+    @Synchronized
+    fun getPairingRequests(): JSONArray {
+        val db = writableDatabase
+        createTables(db)
+        val arr = JSONArray()
+        db.rawQuery(
+            "SELECT request_id, from_device_id, from_nodic_id, from_display_name, from_public_key, host, port, direction, status, created_at FROM pairing_requests ORDER BY created_at DESC",
+            null,
+        ).use { c -> while (c.moveToNext()) arr.put(pairingRequestRow(c)) }
+        return arr
+    }
+
+    private fun pairingRequestRow(c: android.database.Cursor): JSONObject = JSONObject()
+        .put("requestId", c.getString(0))
+        .put("fromDeviceId", c.getString(1))
+        .put("fromNodicId", c.getString(2))
+        .put("fromDisplayName", c.getString(3))
+        .put("fromPublicKey", c.getString(4))
+        .put("host", c.getString(5))
+        .put("port", c.getInt(6))
+        .put("direction", c.getString(7))
+        .put("status", c.getString(8))
+        .put("createdAt", Instant.ofEpochMilli(c.getLong(9)).toString())
+
+    // ---- Keystore-wrapped secret storage (survives WebView storage loss / app kill) ----
+
+    private fun secretKey(): javax.crypto.SecretKey? = try {
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val alias = "nodic-secure-kv-key"
+        if (!ks.containsAlias(alias)) {
+            val gen = javax.crypto.KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+            gen.init(
+                KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .build(),
+            )
+            gen.generateKey()
+        }
+        ks.getKey(alias, null) as? javax.crypto.SecretKey
+    } catch (_: Exception) {
+        null
+    }
+
+    @Synchronized
+    fun secureSet(key: String, value: String) {
+        val db = writableDatabase
+        createTables(db)
+        var stored = "plain:$value"
+        val sk = secretKey()
+        if (sk != null) {
+            try {
+                val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+                cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, sk)
+                val ct = cipher.doFinal(value.toByteArray(Charsets.UTF_8))
+                stored = "enc:" + Base64.encodeToString(cipher.iv, Base64.NO_WRAP) + ":" + Base64.encodeToString(ct, Base64.NO_WRAP)
+            } catch (_: Exception) {}
+        }
+        db.execSQL("INSERT OR REPLACE INTO secure_kv (k, v) VALUES (?, ?)", arrayOf<Any>(key, stored))
+    }
+
+    @Synchronized
+    fun secureGet(key: String): String? {
+        val db = writableDatabase
+        createTables(db)
+        val raw = db.rawQuery("SELECT v FROM secure_kv WHERE k = ?", arrayOf(key)).use {
+            if (it.moveToFirst()) it.getString(0) else null
+        } ?: return null
+        if (raw.startsWith("plain:")) return raw.removePrefix("plain:")
+        if (!raw.startsWith("enc:")) return null
+        return try {
+            val parts = raw.split(":")
+            val iv = Base64.decode(parts[1], Base64.NO_WRAP)
+            val ct = Base64.decode(parts[2], Base64.NO_WRAP)
+            val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(javax.crypto.Cipher.DECRYPT_MODE, secretKey(), javax.crypto.spec.GCMParameterSpec(128, iv))
+            String(cipher.doFinal(ct), Charsets.UTF_8)
+        } catch (_: Exception) {
+            null
+        }
     }
 
     fun verify(): Boolean {
@@ -729,6 +989,33 @@ class PhaseZeroStore(private val appContext: Context) : SQLiteOpenHelper(appCont
     }
 
     @Synchronized
+    fun hasWorkspaceChannel(channelId: String): Boolean {
+        val db = writableDatabase
+        createTables(db)
+        db.rawQuery("SELECT 1 FROM workspace_channels WHERE id = ? LIMIT 1", arrayOf(channelId)).use {
+            return it.moveToFirst()
+        }
+    }
+
+    /**
+     * Stores an event received from a remote peer. Events for channels this device has not
+     * joined (via invite code or by creating them) are dropped, so pairing alone never
+     * grants channel membership. Join requests are transient and always pass through.
+     */
+    @Synchronized
+    fun upsertRemoteWorkspaceEvent(eventJsonStr: String): Boolean {
+        return try {
+            val ev = JSONObject(eventJsonStr)
+            val channelId = ev.optString("channelId")
+            if (channelId.isBlank()) return false
+            if (!hasWorkspaceChannel(channelId)) return false
+            upsertWorkspaceEvent(eventJsonStr)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    @Synchronized
     fun upsertWorkspaceEvent(eventJsonStr: String): Boolean {
         return try {
             val ev = JSONObject(eventJsonStr)
@@ -739,6 +1026,8 @@ class PhaseZeroStore(private val appContext: Context) : SQLiteOpenHelper(appCont
             val lamportClock = ev.optInt("lamportClock", 1)
             val type = ev.optString("type")
             if (id.isBlank() || channelId.isBlank() || type.isBlank()) return false
+            // Join requests are transient and must never be persisted as channel history
+            if (type == "JOIN_REQUESTED") return true
 
             val createdAtStr = ev.optString("createdAt")
             val createdAtMs = try {
@@ -828,5 +1117,7 @@ class PhaseZeroStore(private val appContext: Context) : SQLiteOpenHelper(appCont
         db.execSQL("DELETE FROM peer_identities")
         db.execSQL("DELETE FROM peer_sessions")
         db.execSQL("DELETE FROM sync_logs")
+        db.execSQL("DELETE FROM paired_devices")
+        db.execSQL("DELETE FROM pairing_requests")
     }
 }

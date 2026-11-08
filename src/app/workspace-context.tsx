@@ -68,11 +68,7 @@ interface WorkspaceActions {
   updateMemberRole(deviceId: string, role: MemberRole): Promise<void>;
   removeMember(deviceId: string): Promise<void>;
   updateDisplayName(name: string): Promise<void>;
-  createChannel(
-    name: string,
-    description?: string,
-    broadcastToLAN?: boolean,
-  ): Promise<void>;
+  createChannel(name: string, description?: string): Promise<void>;
   switchChannel(channelId: string): Promise<void>;
   leaveChannel(): Promise<void>;
   recoverChannelSession(channelIdOrSessionId?: string): Promise<boolean>;
@@ -96,6 +92,9 @@ interface WorkspaceActions {
 type WorkspaceContextValue = WorkspaceSnapshot & WorkspaceActions;
 
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
+
+/** Devices allowed to receive a channel's traffic: its members and lead (never merely paired peers). */
+const toMembers = (channelId: string): string[] => repository.getChannelRecipientIds(channelId);
 
 const emptyWorkspace: WorkspaceSnapshot = {
   channel: null,
@@ -210,6 +209,27 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
       const eventListener = nativeSync.plugin.addListener('eventReceived', (data) => {
         try {
           const event = JSON.parse(data.eventJson) as NodicEvent;
+
+          // A prospective member proving itself with an invite code: only the lead acts on it.
+          if (event.type === 'JOIN_REQUESTED') {
+            void repository.handleIncomingJoinRequest(event).then(async (res) => {
+              if (unmounted || !res.accepted || !res.memberEvent) return;
+              await refreshChannels();
+              if (activeChannelIdRef.current === event.channelId) {
+                const refreshed = await repository.loadWorkspace(event.channelId);
+                if (!unmounted) setWorkspace(refreshed);
+              }
+              await syncIdentityState();
+              const recipients = repository.getChannelRecipientIds(event.channelId);
+              void nativeSync.publishEvent(res.memberEvent, recipients);
+              const history = await repository.getAllChannelEvents(event.channelId, 200);
+              if (history.length > 0) void nativeSync.publishBatch(history, [event.authorDeviceId]);
+              const summary = await repository.getSyncSummary(event.channelId);
+              void nativeSync.publishSummary(event.channelId, summary, recipients);
+            });
+            return;
+          }
+
           void repository.applyEvent(event).then(async (updated) => {
             if (unmounted) return;
             setWorkspace(updated);
@@ -222,25 +242,24 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
             if (event.type === 'MEMBER_ADDED') {
               const allEvents = await repository.getAllChannelEvents(event.channelId, 200);
               if (allEvents.length > 0) {
-                void nativeSync.publishBatch(allEvents);
+                void nativeSync.publishBatch(allEvents, toMembers(event.channelId));
               }
               const summary = await repository.getSyncSummary(event.channelId);
-              void nativeSync.publishSummary(event.channelId, summary);
+              void nativeSync.publishSummary(event.channelId, summary, toMembers(event.channelId));
             } else if (event.type === 'CHANNEL_CREATED') {
               const summary = await repository.getSyncSummary(event.channelId);
-              void nativeSync.publishSummary(event.channelId, summary);
+              void nativeSync.publishSummary(event.channelId, summary, toMembers(event.channelId));
             }
 
-            // Phase 2: Relay to other peers if not sender and not local author
-            const peers = await repository.listPeerIdentities();
+            // Phase 2: Relay to other members of this channel (never to non-members)
             const currentIdentity = await repository.getIdentity();
             const relayPeers = filterPeersForRelay(
-              peers.map((p) => p.deviceId),
+              toMembers(event.channelId),
               data.peerId,
               currentIdentity.deviceId,
             );
             if (relayPeers.length > 0 && event.authorDeviceId !== currentIdentity.deviceId) {
-              void nativeSync.publishEvent(event);
+              void nativeSync.publishEvent(event, relayPeers);
             }
           });
         } catch (error) {
@@ -256,16 +275,16 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
           };
           const targetChannelId = payload.channelId ?? activeChannelIdRef.current;
           const sequences = payload.sequences ?? {};
-          if (targetChannelId) {
+          if (targetChannelId && toMembers(targetChannelId).includes(data.peerId)) {
             void repository
               .reconcileWithPeerSummary(targetChannelId, data.peerId, sequences)
               .then(async ({ eventsToSend, missingRangesFromPeer }) => {
                 if (eventsToSend.length > 0) {
-                  void nativeSync.publishBatch(eventsToSend);
+                  void nativeSync.publishBatch(eventsToSend, [data.peerId]);
                 }
                 if (missingRangesFromPeer.length > 0) {
                   const localSummary = await repository.getSyncSummary(targetChannelId);
-                  void nativeSync.publishSummary(targetChannelId, localSummary);
+                  void nativeSync.publishSummary(targetChannelId, localSummary, [data.peerId]);
                 }
               });
           }
@@ -278,11 +297,11 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         const currentChannelId = activeChannelIdRef.current;
         if (status.state === 'CONNECTED' && status.peerCount > 0 && currentChannelId) {
           void repository.getSyncSummary(currentChannelId).then((summary) => {
-            void nativeSync.publishSummary(currentChannelId, summary);
+            void nativeSync.publishSummary(currentChannelId, summary, toMembers(currentChannelId));
           });
           void repository.getAllChannelEvents(currentChannelId, 200).then((events) => {
             if (events.length > 0) {
-              void nativeSync.publishBatch(events);
+              void nativeSync.publishBatch(events, toMembers(currentChannelId));
             }
           });
         }
@@ -357,10 +376,10 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
             const currentChannelId = activeChannelIdRef.current;
             if (respData.accepted && currentChannelId) {
               const summary = await repository.getSyncSummary(currentChannelId);
-              void nativeSync.publishSummary(currentChannelId, summary);
+              void nativeSync.publishSummary(currentChannelId, summary, toMembers(currentChannelId));
               const events = await repository.getAllChannelEvents(currentChannelId, 200);
               if (events.length > 0) {
-                void nativeSync.publishBatch(events);
+                void nativeSync.publishBatch(events, toMembers(currentChannelId));
               }
             }
           });
@@ -411,10 +430,9 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
           lamportClock: updated.lamportClock,
         });
 
-        if (workspace.channel) {
-          const currentUserRole =
-            workspace.channel.members.find((m) => m.deviceId === updated.deviceId)?.role ??
-            'MEMBER';
+        const selfRole = workspace.channel?.members.find((m) => m.deviceId === updated.deviceId)?.role;
+        if (workspace.channel && selfRole === 'LEAD') {
+          const currentUserRole = selfRole;
           const { event, snapshot } = await repository.commitLocalEvent(
             workspace.channel.id,
             'MEMBER_ADDED',
@@ -429,16 +447,16 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
           );
           setWorkspace(snapshot);
           await syncIdentityState();
-          void nativeSync.publishEvent(event);
+          void nativeSync.publishEvent(event, toMembers(event.channelId));
         }
         await refreshDiagnosticsState();
       },
 
-      async createChannel(name, description, broadcastToLAN = true) {
+      async createChannel(name, description) {
         const cleanName = name.trim();
         if (!cleanName) return;
 
-        const { snapshot, genesisEvent } = await repository.createChannel(
+        const { snapshot } = await repository.createChannel(
           cleanName,
           description,
         );
@@ -446,10 +464,8 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         await syncIdentityState();
         await refreshChannels();
         await refreshDiagnosticsState();
-
-        if (broadcastToLAN) {
-          void nativeSync.publishEvent(genesisEvent);
-        }
+        // Nothing is broadcast: a new channel stays private to its lead until someone
+        // joins it with an invite code.
       },
 
       async switchChannel(channelId: string) {
@@ -473,10 +489,10 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         if (snapshot.channel) {
           const events = await repository.getAllChannelEvents(snapshot.channel.id, 200);
           if (events.length > 0) {
-            void nativeSync.publishBatch(events);
+            void nativeSync.publishBatch(events, toMembers(snapshot.channel.id));
           }
           const summary = await repository.getSyncSummary(snapshot.channel.id);
-          void nativeSync.publishSummary(snapshot.channel.id, summary);
+          void nativeSync.publishSummary(snapshot.channel.id, summary, toMembers(snapshot.channel.id));
           return true;
         }
         return false;
@@ -500,10 +516,10 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         if (res.connected && workspace.channel?.id) {
           const events = await repository.getAllChannelEvents(workspace.channel.id);
           if (events.length > 0) {
-            void nativeSync.publishBatch(events);
+            void nativeSync.publishBatch(events, toMembers(workspace.channel.id));
           }
           const summary = await repository.getSyncSummary(workspace.channel.id);
-          void nativeSync.publishSummary(workspace.channel.id, summary);
+          void nativeSync.publishSummary(workspace.channel.id, summary, toMembers(workspace.channel.id));
         }
         return res.connected;
       },
@@ -520,10 +536,10 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         if (res.accepted && workspace.channel?.id) {
           const events = await repository.getAllChannelEvents(workspace.channel.id);
           if (events.length > 0) {
-            void nativeSync.publishBatch(events);
+            void nativeSync.publishBatch(events, toMembers(workspace.channel.id));
           }
           const summary = await repository.getSyncSummary(workspace.channel.id);
-          void nativeSync.publishSummary(workspace.channel.id, summary);
+          void nativeSync.publishSummary(workspace.channel.id, summary, toMembers(workspace.channel.id));
         }
       },
 
@@ -562,7 +578,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         setWorkspace(snapshot);
         await syncIdentityState();
         await refreshDiagnosticsState();
-        void nativeSync.publishEvent(event);
+        void nativeSync.publishEvent(event, toMembers(event.channelId));
       },
 
       async moveTask(taskId, status) {
@@ -595,7 +611,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         setWorkspace(snapshot);
         await syncIdentityState();
         await refreshDiagnosticsState();
-        void nativeSync.publishEvent(event);
+        void nativeSync.publishEvent(event, toMembers(event.channelId));
       },
 
       async updateTask(taskId, fields) {
@@ -619,7 +635,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         setWorkspace(snapshot);
         await syncIdentityState();
         await refreshDiagnosticsState();
-        void nativeSync.publishEvent(event);
+        void nativeSync.publishEvent(event, toMembers(event.channelId));
       },
 
       async archiveTask(taskId) {
@@ -643,7 +659,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         setWorkspace(snapshot);
         await syncIdentityState();
         await refreshDiagnosticsState();
-        void nativeSync.publishEvent(event);
+        void nativeSync.publishEvent(event, toMembers(event.channelId));
       },
 
       async sendMessage(body) {
@@ -661,7 +677,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         setWorkspace(snapshot);
         await syncIdentityState();
         await refreshDiagnosticsState();
-        void nativeSync.publishEvent(event);
+        void nativeSync.publishEvent(event, toMembers(event.channelId));
       },
 
       async createInvitation(expiresInHours = 24) {
@@ -699,16 +715,28 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         });
         const code = encodeInvitationCode(invitation);
 
+        await repository.registerInvitation({
+          invitationId: invitation.invitationId,
+          joinSecret: invitation.joinSecret,
+          expiresAt: invitation.expiresAt,
+          channelId: workspace.channel.id,
+        });
+
+        // The join secret itself must never enter the event log or travel over the network
         const { event } = await repository.commitLocalEvent(
           workspace.channel.id,
           'INVITATION_CREATED',
-          invitation,
+          {
+            channelId: invitation.channelId,
+            invitationId: invitation.invitationId,
+            expiresAt: invitation.expiresAt,
+          },
           invitation.invitationId,
         );
 
         await syncIdentityState();
         await refreshDiagnosticsState();
-        void nativeSync.publishEvent(event);
+        void nativeSync.publishEvent(event, toMembers(event.channelId));
         return code;
       },
 
@@ -717,61 +745,50 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         if (!parsed.success) {
           return { success: false, message: parsed.error };
         }
+        const invitation = parsed.invitation;
+        const leadDeviceId = invitation.leadDeviceId;
+        if (!leadDeviceId) {
+          return { success: false, message: 'This invitation does not identify a channel lead.' };
+        }
+
+        // Joining needs a channel lead who validates the invite code, so the two devices must
+        // be connected (paired) first - exactly like pairing before exchanging data.
+        if (!(await repository.isPairedWith(leadDeviceId))) {
+          return {
+            success: false,
+            message: `Connect to the channel lead first (Network > Connect by Nodic User ID: nodic-${leadDeviceId.slice(0, 8)}), then enter the invite code again.`,
+          };
+        }
 
         if (displayName?.trim()) {
           await repository.updateDisplayName(displayName.trim());
         }
 
-        await repository.joinChannel(
-          parsed.invitation.channelId,
-          parsed.invitation.channelName,
-          parsed.invitation.leadDeviceId,
+        const snapshot = await repository.joinChannel(
+          invitation.channelId,
+          invitation.channelName,
+          leadDeviceId,
           {
-            description: parsed.invitation.channelDescription ?? null,
-            sessionId: parsed.invitation.sessionId,
-            leadDisplayName: parsed.invitation.leadDisplayName,
-            leadPublicKey: parsed.invitation.leadPublicKey,
+            description: invitation.channelDescription ?? null,
+            sessionId: invitation.sessionId,
+            leadDisplayName: invitation.leadDisplayName,
+            leadPublicKey: invitation.leadPublicKey,
           },
         );
-        const idRecord = await repository.getIdentity();
 
-        // If the invitation includes the lead's LAN endpoint, automatically initiate a direct TCP connection
-        if (parsed.invitation.leadEndpoint) {
-          const parts = parsed.invitation.leadEndpoint.split(':');
-          const host = parts[0]?.trim();
-          const port = Number(parts[1] ?? 42110);
-          if (host && host !== '0.0.0.0' && port > 0) {
-            try {
-              await repository.connectToPeer(host, port, {
-                deviceId: parsed.invitation.leadDeviceId,
-                displayName: parsed.invitation.leadDisplayName,
-                publicKey: parsed.invitation.leadPublicKey,
-              });
-            } catch {}
-          }
-        }
+        // Request admission: the lead verifies the invite secret and answers with a signed
+        // MEMBER_ADDED event. Membership is not final until that event arrives.
+        const joinRequest = await repository.buildJoinRequestEvent(invitation.channelId, {
+          invitationId: invitation.invitationId,
+          joinSecret: invitation.joinSecret,
+        });
+        void nativeSync.publishEvent(joinRequest, [leadDeviceId]);
 
-        const memberEvent = await repository.commitLocalEvent(
-          parsed.invitation.channelId,
-          'MEMBER_ADDED',
-          {
-            deviceId: idRecord.deviceId,
-            displayName: idRecord.displayName,
-            role: 'MEMBER',
-            publicSigningKey: idRecord.publicSigningKey,
-            publicKey: idRecord.publicSigningKey,
-          },
-          idRecord.deviceId,
-        );
-
-        setWorkspace(memberEvent.snapshot);
+        setWorkspace(snapshot);
         await syncIdentityState();
         await refreshChannels();
         await refreshDiagnosticsState();
-        void nativeSync.publishEvent(memberEvent.event);
-        const summary = await repository.getSyncSummary(parsed.invitation.channelId);
-        void nativeSync.publishSummary(parsed.invitation.channelId, summary);
-        return { success: true, message: 'Joined channel successfully!' };
+        return { success: true, message: 'Join request sent to the channel lead.' };
       },
 
       async updateMemberRole(deviceId, role) {
@@ -798,7 +815,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         setWorkspace(snapshot);
         await syncIdentityState();
         await refreshDiagnosticsState();
-        void nativeSync.publishEvent(event);
+        void nativeSync.publishEvent(event, toMembers(event.channelId));
       },
 
       async removeMember(deviceId) {
@@ -829,8 +846,8 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         setWorkspace(snapshot);
         await syncIdentityState();
         await refreshDiagnosticsState();
-        void nativeSync.publishEvent(removeEvent);
-        void nativeSync.publishEvent(rotateEvent);
+        void nativeSync.publishEvent(removeEvent, toMembers(removeEvent.channelId));
+        void nativeSync.publishEvent(rotateEvent, toMembers(rotateEvent.channelId));
       },
     }),
     [

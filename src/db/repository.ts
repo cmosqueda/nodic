@@ -305,20 +305,44 @@ export class NodicRepository {
   private activeChannelId: string | null = null;
   private eventQueue: Promise<unknown> = Promise.resolve();
 
+  /**
+   * Creates every table one statement at a time (a single failing statement must not abort the
+   * rest) and verifies the required tables exist. Throws if the database is unusable so the
+   * caller can fall back to native PhaseZeroStore + localStorage instead of crashing later.
+   */
+  private async ensureSchema(db: NodicDatabase): Promise<void> {
+    const statements = INITIAL_SCHEMA_SQL.split(';')
+      .map((st) => st.trim())
+      .filter(Boolean);
+    for (const stmt of statements) {
+      try {
+        await db.connection.execute(`${stmt};`, false);
+      } catch (err) {
+        console.warn('Schema statement failed:', stmt.slice(0, 60), err);
+      }
+    }
+    try {
+      await db.connection.execute('ALTER TABLE channels ADD COLUMN session_id TEXT;', false);
+    } catch {
+      // Column already exists
+    }
+
+    const required = ['device_identity', 'channels', 'events', 'members', 'paired_devices', 'pairing_requests'];
+    const res = await db.connection.query("SELECT name FROM sqlite_master WHERE type = 'table'");
+    const present = new Set((res.values ?? []).map((r) => String(r.name)));
+    const missing = required.filter((t) => !present.has(t));
+    if (missing.length > 0) {
+      throw new Error(`SQLite schema incomplete, missing tables: ${missing.join(', ')}`);
+    }
+  }
+
   async init(defaultDisplayName?: string): Promise<WorkspaceSnapshot> {
     if (Capacitor.isNativePlatform()) {
       try {
         this.nodicDb = await openNodicDatabase();
-        await this.nodicDb.connection.execute(INITIAL_SCHEMA_SQL, false);
-        try {
-          await this.nodicDb.connection.execute(
-            'ALTER TABLE channels ADD COLUMN session_id TEXT;',
-            false,
-          );
-        } catch {
-          // Column already exists
-        }
+        await this.ensureSchema(this.nodicDb);
       } catch (err) {
+        this.nodicDb = null;
         console.warn('Native SQLite init failed, falling back to native PhaseZeroStore + localStorage:', err);
       }
     } else {
@@ -403,10 +427,23 @@ export class NodicRepository {
     deviceId: string,
     existingPublicKey?: string,
   ): Promise<{ publicKey: string; privateKey: CryptoKey | null }> {
-    const storedPrivJwk = readStorageJson<string | null>(
-      `${STORAGE_KEYS.PRIVATE_KEY_PREFIX}${deviceId}`,
-      null,
-    );
+    const privKeyStorageKey = `${STORAGE_KEYS.PRIVATE_KEY_PREFIX}${deviceId}`;
+    // WebView localStorage can be lost when the app process is killed; the native
+    // Keystore-wrapped secure store is the durable copy.
+    let storedPrivJwk = readStorageJson<string | null>(privKeyStorageKey, null);
+    if (!storedPrivJwk) {
+      const nativeCopy = await nativeSync.secureGet(privKeyStorageKey);
+      if (nativeCopy) {
+        try {
+          storedPrivJwk = JSON.parse(nativeCopy) as string;
+          writeStorageJson(privKeyStorageKey, storedPrivJwk);
+        } catch {
+          storedPrivJwk = null;
+        }
+      }
+    } else {
+      void nativeSync.secureSet(privKeyStorageKey, JSON.stringify(storedPrivJwk));
+    }
     if (storedPrivJwk && existingPublicKey && existingPublicKey.startsWith('p256:')) {
       const imported = await importPrivateSigningKey(storedPrivJwk);
       if (imported) {
@@ -418,7 +455,8 @@ export class NodicRepository {
       const keyPair = await generateDeviceKeyPair();
       const exported = await exportPrivateSigningKey(keyPair.privateKey);
       if (exported) {
-        writeStorageJson(`${STORAGE_KEYS.PRIVATE_KEY_PREFIX}${deviceId}`, exported);
+        writeStorageJson(privKeyStorageKey, exported);
+        await nativeSync.secureSet(privKeyStorageKey, JSON.stringify(exported));
       }
       return { publicKey: keyPair.publicKey, privateKey: keyPair.privateKey };
     } catch {
@@ -707,6 +745,22 @@ export class NodicRepository {
     );
     savedPairReqs.forEach((r) => this.memoryPairingRequests.set(r.requestId, r));
 
+    // Native store is the durable copy (survives WebView storage loss); merge it in,
+    // keeping whichever record was updated most recently.
+    if (Capacitor.isNativePlatform()) {
+      const nativePairing = await nativeSync.getPairingState();
+      for (const d of nativePairing.pairedDevices) {
+        const cur = this.memoryPairedDevices.get(d.deviceId);
+        if (!cur || new Date(d.updatedAt).getTime() >= new Date(cur.updatedAt).getTime()) {
+          this.memoryPairedDevices.set(d.deviceId, d);
+        }
+      }
+      for (const r of nativePairing.pairingRequests) {
+        const cur = this.memoryPairingRequests.get(r.requestId);
+        if (!cur || cur.status === 'PENDING') this.memoryPairingRequests.set(r.requestId, r);
+      }
+    }
+
     // 1. Restore channel keys and invitations from localStorage
     const savedKeys = readStorageJson<Record<string, Record<string, string>>>(
       `${STORAGE_KEYS.CHANNEL_KEYS_PREFIX}${devId}`,
@@ -863,28 +917,8 @@ export class NodicRepository {
       }
     }
 
-    // 5. Ensure every channel with events has metadata
-    for (const [channelId, evMap] of eventsByChannel.entries()) {
-      if (!metaByChannel.has(channelId)) {
-        const events = Array.from(evMap.values());
-        const genesis = events.find((e) => e.type === 'CHANNEL_CREATED');
-        const payload = (genesis?.payload ?? {}) as {
-          name?: string;
-          description?: string;
-          sessionId?: string;
-        };
-        addChannelMeta({
-          id: channelId,
-          sessionId: payload.sessionId ?? `sess-${channelId.slice(0, 8)}`,
-          name: payload.name ?? 'Connected Channel',
-          description: payload.description ?? null,
-          leadDeviceId: genesis?.authorDeviceId ?? 'remote-lead',
-          genesisEventId: genesis?.id ?? 'joined',
-          keyVersion: 1,
-          createdAt: genesis ? new Date(genesis.createdAt).getTime() || Date.now() : Date.now(),
-        });
-      }
-    }
+    // 5. Events for channels without metadata are ignored: a channel only exists locally if
+    // this device created it or joined it with an invite code. Remote events never create one.
 
     // 6. Rebuild materialized state for each channel by replaying sorted events
     let maxAuthorSeq = this.authorSequence;
@@ -893,10 +927,20 @@ export class NodicRepository {
     for (const [channelId, meta] of metaByChannel.entries()) {
       const evMap = eventsByChannel.get(channelId);
       const sortedEvents = this.sortEventsCausally(evMap ? Array.from(evMap.values()) : []);
+
+      const isSelfLead = meta.leadDeviceId === identity.deviceId;
+      const hasSelfMemberEvent = sortedEvents.some(
+        (e) =>
+          e.type === 'MEMBER_ADDED' &&
+          (e.payload as { deviceId?: string }).deviceId === identity.deviceId,
+      );
+      // Only channels this device created or joined (invite code) are restored. Anything else
+      // (e.g. channels auto-bootstrapped by earlier versions) is not a membership.
+      const isEligible = isSelfLead || hasSelfMemberEvent || meta.genesisEventId === 'joined';
+      if (!isEligible) continue;
       this.memoryEvents.set(channelId, sortedEvents);
 
       const initialMembers: Member[] = [];
-      const isSelfLead = meta.leadDeviceId === identity.deviceId;
       initialMembers.push({
         deviceId: identity.deviceId,
         displayName: identity.displayName,
@@ -905,6 +949,19 @@ export class NodicRepository {
         presence: 'ONLINE',
         initials: identity.displayName.slice(0, 2).toUpperCase(),
       });
+
+      if (!isSelfLead && meta.leadDeviceId && meta.leadDeviceId !== 'remote-lead') {
+        const leadPaired = this.memoryPairedDevices.get(meta.leadDeviceId);
+        const leadName = leadPaired?.displayName ?? `Lead-${meta.leadDeviceId.slice(0, 4).toUpperCase()}`;
+        initialMembers.push({
+          deviceId: meta.leadDeviceId,
+          displayName: leadName,
+          publicSigningKey: leadPaired?.publicSigningKey,
+          role: 'LEAD',
+          presence: 'RECENT',
+          initials: leadName.slice(0, 2).toUpperCase(),
+        });
+      }
 
       const baseChannel: Channel = {
         id: channelId,
@@ -1348,6 +1405,8 @@ export class NodicRepository {
 
     this.memoryPairedDevices.set(device.deviceId, device);
     this.persistLocalWorkspaceState();
+    // Native transport enforces pairing, so it needs its own durable copy
+    await nativeSync.savePairedDevice(device);
     return device;
   }
 
@@ -1408,6 +1467,7 @@ export class NodicRepository {
     }
     this.memoryPairingRequests.set(req.requestId, req);
     this.persistLocalWorkspaceState();
+    await nativeSync.savePairingRequest(req);
     return req;
   }
 
@@ -1930,6 +1990,7 @@ export class NodicRepository {
       );
       for (const r of res.values ?? []) {
         const id = r.id as string;
+        if (!this.memoryChannels.has(id)) continue;
         byId.set(id, {
           id,
           sessionId: (r.session_id as string) || `sess-${id.slice(0, 8)}`,
@@ -2077,7 +2138,9 @@ export class NodicRepository {
         : await this.nodicDb.connection.query(
             'SELECT * FROM channels ORDER BY created_at DESC LIMIT 1',
           );
-      const chanRows = chanRes.values ?? [];
+      const chanRows = (chanRes.values ?? []).filter((r) =>
+        this.memoryChannels.has(r.id as string),
+      );
 
       if (chanRows.length > 0) {
         const chan = chanRows[0];
@@ -2441,28 +2504,20 @@ export class NodicRepository {
       await this.loadWorkspace(event.channelId);
     }
 
-    // If receiving an event for a channel that does not exist locally yet, bootstrap its materialized state
+    // Join requests are transient: they are evaluated by handleIncomingJoinRequest and never
+    // become part of channel history.
+    if (event.type === 'JOIN_REQUESTED') {
+      return this.loadWorkspace();
+    }
+
+    // Invite-only membership: a remote event can never create a channel here. A channel exists
+    // locally only if this device created it or joined it with a validated invite code.
+    const targetState = this.memoryChannels.get(event.channelId);
+    if (!targetState) {
+      await this.quarantineRejectedEvent(event.id, event.authorDeviceId, 'NOT_A_MEMBER_OF_CHANNEL');
+      return this.loadWorkspace();
+    }
     if (!this.memoryState || this.memoryState.channel.id !== event.channelId) {
-      let targetState = this.memoryChannels.get(event.channelId);
-      if (!targetState) {
-        const payload = event.payload as {
-          name?: string;
-          description?: string;
-          sessionId?: string;
-        };
-        const bootstrapChannel: Channel = {
-          id: event.channelId,
-          sessionId: payload.sessionId ?? `sess-${event.channelId.slice(0, 8)}`,
-          name: payload.name ?? 'Connected Channel',
-          description: payload.description ?? null,
-          currentUserDeviceId: identity.deviceId,
-          leadDeviceId:
-            event.type === 'CHANNEL_CREATED' ? event.authorDeviceId : 'remote-lead',
-          members: [],
-        };
-        targetState = createInitialMaterializedState(bootstrapChannel);
-        this.memoryChannels.set(event.channelId, targetState);
-      }
       this.memoryState = targetState;
     }
 
@@ -3105,7 +3160,9 @@ export class NodicRepository {
   async processJoinRequest(req: {
     channelId: string;
     invitationId: string;
-    joinSecret: string;
+    /** Raw invite secret (local callers) or its hash as sent over the wire (`joinProof`). */
+    joinSecret?: string;
+    joinProof?: string;
     applicantDeviceId: string;
     applicantDisplayName: string;
     applicantPublicKey: string;
@@ -3124,7 +3181,7 @@ export class NodicRepository {
       return { accepted: false, reason: 'Invitation has expired' };
     }
 
-    const providedHash = await hashSecret(req.joinSecret);
+    const providedHash = req.joinProof ?? (req.joinSecret ? await hashSecret(req.joinSecret) : '');
     if (!constantTimeCompare(providedHash, stored.hash)) {
       return { accepted: false, reason: 'Invalid invitation secret' };
     }
@@ -3142,6 +3199,10 @@ export class NodicRepository {
       req.applicantDeviceId,
     );
 
+    // Invitations are single-use by default
+    this.storedInvitations.delete(req.invitationId);
+    this.persistLocalWorkspaceState();
+
     const activeVersion = this.getActiveKeyVersion(req.channelId);
     const channelKey = this.getChannelKey(req.channelId, activeVersion) ?? undefined;
 
@@ -3150,6 +3211,147 @@ export class NodicRepository {
       memberEvent: event,
       channelKey,
     };
+  }
+
+  /** Records an invitation's secret hash so the lead can validate join requests against it. */
+  async registerInvitation(invitation: {
+    invitationId: string;
+    joinSecret: string;
+    expiresAt: string;
+    channelId: string;
+  }): Promise<void> {
+    this.storedInvitations.set(invitation.invitationId, {
+      hash: await hashSecret(invitation.joinSecret),
+      expiresAt: invitation.expiresAt,
+      channelId: invitation.channelId,
+    });
+    this.persistLocalWorkspaceState();
+  }
+
+  /** True when this device has an accepted pairing with the given device. */
+  async isPairedWith(deviceId: string): Promise<boolean> {
+    const list = await this.listPairedDevices();
+    return list.some((d) => d.deviceId === deviceId && d.pairingState === 'PAIRED');
+  }
+
+  /**
+   * Devices a channel's traffic may be sent to: its members plus the lead. Pairing alone
+   * never entitles a device to channel data.
+   */
+  getChannelRecipientIds(channelId: string): string[] {
+    const state = this.memoryChannels.get(channelId);
+    if (!state) return [];
+    const ids = new Set<string>(state.members.keys());
+    if (state.channel.leadDeviceId && state.channel.leadDeviceId !== 'remote-lead') {
+      ids.add(state.channel.leadDeviceId);
+    }
+    if (this.identity) ids.delete(this.identity.deviceId);
+    return Array.from(ids);
+  }
+
+  /**
+   * Builds the signed, transient request a prospective member sends to the channel lead.
+   * It carries a hash of the invite secret, is never stored in channel history and does not
+   * consume an author sequence number.
+   */
+  async buildJoinRequestEvent(
+    channelId: string,
+    invitation: { invitationId: string; joinSecret: string },
+  ): Promise<NodicEvent> {
+    const identity = await this.getIdentity();
+    const eventWithoutSig: Omit<NodicEvent, 'signature'> = {
+      protocolVersion: 1,
+      id: crypto.randomUUID(),
+      channelId,
+      authorDeviceId: identity.deviceId,
+      authorSequence: 1,
+      lamportClock: identity.lamportClock,
+      type: 'JOIN_REQUESTED',
+      keyVersion: 1,
+      createdAt: new Date().toISOString(),
+      payloadVersion: 1,
+      payload: {
+        deviceId: identity.deviceId,
+        displayName: identity.displayName,
+        publicSigningKey: identity.publicSigningKey,
+        invitationId: invitation.invitationId,
+        joinProof: await hashSecret(invitation.joinSecret),
+      },
+    };
+    let signature = `sig-${identity.deviceId.slice(0, 8)}-join`;
+    if (this.privateSigningKey) {
+      try {
+        signature = await signEvent(eventWithoutSig, this.privateSigningKey);
+      } catch {
+        // keep fallback signature
+      }
+    }
+    return { ...eventWithoutSig, signature };
+  }
+
+  /**
+   * Lead side: validates a JOIN_REQUESTED event against the stored invitation and, if valid,
+   * emits the signed MEMBER_ADDED event that actually admits the applicant.
+   */
+  async handleIncomingJoinRequest(event: NodicEvent): Promise<{
+    accepted: boolean;
+    reason?: string;
+    memberEvent?: NodicEvent;
+  }> {
+    const identity = await this.getIdentity();
+    const state = this.memoryChannels.get(event.channelId);
+    if (!state || state.channel.leadDeviceId !== identity.deviceId) {
+      return { accepted: false, reason: 'Only the channel lead can admit members' };
+    }
+    const payload = event.payload as {
+      deviceId?: string;
+      displayName?: string;
+      publicSigningKey?: string;
+      invitationId?: string;
+      joinProof?: string;
+    };
+    if (
+      !payload.deviceId ||
+      payload.deviceId !== event.authorDeviceId ||
+      !payload.invitationId ||
+      !payload.joinProof ||
+      !payload.publicSigningKey
+    ) {
+      return { accepted: false, reason: 'Malformed join request' };
+    }
+    if (
+      payload.publicSigningKey.startsWith('p256:') &&
+      !payload.publicSigningKey.startsWith('p256:mock-') &&
+      !payload.publicSigningKey.startsWith('p256:peer-') &&
+      !payload.publicSigningKey.startsWith('p256:nodic-') &&
+      !event.signature.startsWith('sig-')
+    ) {
+      const validSig = await verifyEventSignature(event, payload.publicSigningKey);
+      if (!validSig) {
+        await this.quarantineRejectedEvent(event.id, event.authorDeviceId, 'INVALID_SIGNATURE');
+        return { accepted: false, reason: 'Invalid join request signature' };
+      }
+    }
+    const res = await this.processJoinRequest({
+      channelId: event.channelId,
+      invitationId: payload.invitationId,
+      joinProof: payload.joinProof,
+      applicantDeviceId: payload.deviceId,
+      applicantDisplayName: payload.displayName ?? `Node-${payload.deviceId.slice(0, 4).toUpperCase()}`,
+      applicantPublicKey: payload.publicSigningKey,
+    });
+    if (!res.accepted) {
+      await this.recordSyncLog({
+        level: 'WARN',
+        category: 'EVENT',
+        peerDeviceId: event.authorDeviceId,
+        sessionId: null,
+        message: `Rejected join request: ${res.reason ?? 'invalid invitation'}`,
+        detailsJson: JSON.stringify({ channelId: event.channelId, invitationId: payload.invitationId }),
+      });
+      return { accepted: false, reason: res.reason };
+    }
+    return { accepted: true, memberEvent: res.memberEvent };
   }
 }
 
