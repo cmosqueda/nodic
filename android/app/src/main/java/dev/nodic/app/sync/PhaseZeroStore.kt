@@ -21,7 +21,7 @@ data class LocalNodeIdentity(
     val keystoreAlias: String,
 )
 
-class PhaseZeroStore(private val appContext: Context) : SQLiteOpenHelper(appContext, "nodic-phase0.db", null, 2) {
+class PhaseZeroStore(private val appContext: Context) : SQLiteOpenHelper(appContext, "nodic-phase0.db", null, 3) {
     override fun onCreate(db: SQLiteDatabase) {
         createTables(db)
     }
@@ -38,6 +38,36 @@ class PhaseZeroStore(private val appContext: Context) : SQLiteOpenHelper(appCont
                 from_peer TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 received_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS workspace_channels (
+                id TEXT PRIMARY KEY NOT NULL,
+                session_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                lead_device_id TEXT NOT NULL,
+                genesis_event_id TEXT NOT NULL,
+                key_version INTEGER NOT NULL DEFAULT 1,
+                channel_key TEXT,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS workspace_events (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                author_device_id TEXT NOT NULL,
+                author_sequence INTEGER NOT NULL,
+                lamport_clock INTEGER NOT NULL,
+                type TEXT NOT NULL,
+                event_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
             )
             """.trimIndent(),
         )
@@ -598,5 +628,205 @@ class PhaseZeroStore(private val appContext: Context) : SQLiteOpenHelper(appCont
             "INSERT OR IGNORE INTO phase_zero_events (id, from_peer, payload, received_at) VALUES (?, ?, ?, ?)",
             arrayOf<Any>(id, fromPeer, payload, System.currentTimeMillis()),
         )
+    }
+
+    @Synchronized
+    fun upsertWorkspaceChannel(
+        id: String,
+        sessionId: String,
+        name: String,
+        description: String?,
+        leadDeviceId: String,
+        genesisEventId: String,
+        keyVersion: Int = 1,
+        channelKey: String? = null,
+        isActive: Boolean = true,
+        createdAt: Long = System.currentTimeMillis(),
+    ) {
+        val db = writableDatabase
+        createTables(db)
+        if (isActive) {
+            db.execSQL("UPDATE workspace_channels SET is_active = 0")
+        }
+        db.execSQL(
+            """
+            INSERT INTO workspace_channels (
+                id, session_id, name, description, lead_device_id, genesis_event_id, key_version, channel_key, is_active, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                session_id = COALESCE(NULLIF(excluded.session_id, ''), workspace_channels.session_id),
+                name = CASE WHEN excluded.name != 'Connected Channel' THEN excluded.name ELSE workspace_channels.name END,
+                description = COALESCE(excluded.description, workspace_channels.description),
+                lead_device_id = CASE WHEN excluded.lead_device_id != 'remote-lead' THEN excluded.lead_device_id ELSE workspace_channels.lead_device_id END,
+                genesis_event_id = CASE WHEN excluded.genesis_event_id != 'joined' THEN excluded.genesis_event_id ELSE workspace_channels.genesis_event_id END,
+                key_version = MAX(workspace_channels.key_version, excluded.key_version),
+                channel_key = COALESCE(excluded.channel_key, workspace_channels.channel_key),
+                is_active = excluded.is_active
+            """.trimIndent(),
+            arrayOf<Any?>(
+                id,
+                sessionId,
+                name,
+                description,
+                leadDeviceId,
+                genesisEventId,
+                keyVersion,
+                channelKey,
+                if (isActive) 1 else 0,
+                createdAt,
+            ),
+        )
+    }
+
+    @Synchronized
+    fun setActiveWorkspaceChannel(channelId: String?) {
+        val db = writableDatabase
+        createTables(db)
+        db.execSQL("UPDATE workspace_channels SET is_active = 0")
+        if (!channelId.isNullOrBlank()) {
+            db.execSQL("UPDATE workspace_channels SET is_active = 1 WHERE id = ?", arrayOf<Any>(channelId))
+        }
+    }
+
+    @Synchronized
+    fun getWorkspaceChannels(): JSONArray {
+        val db = writableDatabase
+        createTables(db)
+        val arr = JSONArray()
+        db.rawQuery(
+            """
+            SELECT id, session_id, name, description, lead_device_id, genesis_event_id, key_version, channel_key, is_active, created_at
+            FROM workspace_channels ORDER BY is_active DESC, created_at DESC
+            """.trimIndent(),
+            null,
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                arr.put(
+                    JSONObject()
+                        .put("id", cursor.getString(0))
+                        .put("sessionId", cursor.getString(1))
+                        .put("name", cursor.getString(2))
+                        .put("description", if (cursor.isNull(3)) JSONObject.NULL else cursor.getString(3))
+                        .put("leadDeviceId", cursor.getString(4))
+                        .put("genesisEventId", cursor.getString(5))
+                        .put("keyVersion", cursor.getInt(6))
+                        .put("channelKey", if (cursor.isNull(7)) JSONObject.NULL else cursor.getString(7))
+                        .put("isActive", cursor.getInt(8) == 1)
+                        .put("createdAt", cursor.getLong(9)),
+                )
+            }
+        }
+        return arr
+    }
+
+    @Synchronized
+    fun hasWorkspaceEvent(eventId: String): Boolean {
+        val db = writableDatabase
+        createTables(db)
+        db.rawQuery("SELECT 1 FROM workspace_events WHERE id = ? LIMIT 1", arrayOf(eventId)).use { cursor ->
+            return cursor.moveToFirst()
+        }
+    }
+
+    @Synchronized
+    fun upsertWorkspaceEvent(eventJsonStr: String): Boolean {
+        return try {
+            val ev = JSONObject(eventJsonStr)
+            val id = ev.optString("id")
+            val channelId = ev.optString("channelId")
+            val authorDeviceId = ev.optString("authorDeviceId")
+            val authorSequence = ev.optInt("authorSequence", 1)
+            val lamportClock = ev.optInt("lamportClock", 1)
+            val type = ev.optString("type")
+            if (id.isBlank() || channelId.isBlank() || type.isBlank()) return false
+
+            val createdAtStr = ev.optString("createdAt")
+            val createdAtMs = try {
+                Instant.parse(createdAtStr).toEpochMilli()
+            } catch (_: Exception) {
+                System.currentTimeMillis()
+            }
+
+            val db = writableDatabase
+            createTables(db)
+            db.execSQL(
+                """
+                INSERT OR IGNORE INTO workspace_events (
+                    id, channel_id, author_device_id, author_sequence, lamport_clock, type, event_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any>(
+                    id,
+                    channelId,
+                    authorDeviceId,
+                    authorSequence,
+                    lamportClock,
+                    type,
+                    eventJsonStr,
+                    createdAtMs,
+                ),
+            )
+
+            if (type == "CHANNEL_CREATED") {
+                val payload = ev.optJSONObject("payload") ?: JSONObject()
+                val name = payload.optString("name", "Channel")
+                val desc = if (payload.isNull("description")) null else payload.optString("description")
+                val sessionId = payload.optString("sessionId").takeIf { it.isNotBlank() }
+                    ?: "sess-${channelId.take(12)}"
+                upsertWorkspaceChannel(
+                    id = channelId,
+                    sessionId = sessionId,
+                    name = name,
+                    description = desc,
+                    leadDeviceId = authorDeviceId,
+                    genesisEventId = id,
+                    keyVersion = ev.optInt("keyVersion", 1),
+                    channelKey = null,
+                    isActive = true,
+                    createdAt = createdAtMs,
+                )
+            }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    @Synchronized
+    fun getWorkspaceEvents(channelId: String? = null, limit: Int = 500): JSONArray {
+        val db = writableDatabase
+        createTables(db)
+        val arr = JSONArray()
+        val sql = if (!channelId.isNullOrBlank()) {
+            "SELECT event_json FROM workspace_events WHERE channel_id = ? ORDER BY lamport_clock ASC, author_sequence ASC, created_at ASC LIMIT ?"
+        } else {
+            "SELECT event_json FROM workspace_events ORDER BY lamport_clock ASC, author_sequence ASC, created_at ASC LIMIT ?"
+        }
+        val args = if (!channelId.isNullOrBlank()) {
+            arrayOf(channelId, limit.toString())
+        } else {
+            arrayOf(limit.toString())
+        }
+        db.rawQuery(sql, args).use { cursor ->
+            while (cursor.moveToNext()) {
+                val raw = cursor.getString(0)
+                try {
+                    arr.put(JSONObject(raw))
+                } catch (_: Exception) {}
+            }
+        }
+        return arr
+    }
+
+    @Synchronized
+    fun clearWorkspaceData() {
+        val db = writableDatabase
+        createTables(db)
+        db.execSQL("DELETE FROM workspace_channels")
+        db.execSQL("DELETE FROM workspace_events")
+        db.execSQL("DELETE FROM phase_zero_events")
+        db.execSQL("DELETE FROM peer_identities")
+        db.execSQL("DELETE FROM peer_sessions")
+        db.execSQL("DELETE FROM sync_logs")
     }
 }

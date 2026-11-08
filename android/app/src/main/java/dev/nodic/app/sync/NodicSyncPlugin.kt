@@ -151,6 +151,7 @@ class NodicSyncPlugin : Plugin() {
             call.reject("eventJson is required", "INVALID_EVENT")
             return
         }
+        PhaseZeroStore(context).use { it.upsertWorkspaceEvent(eventJson) }
         val eventId = Regex("\\\"id\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"").find(eventJson)?.groupValues?.get(1) ?: UUID.randomUUID().toString()
         val accepted = NodicSyncService.broadcastEvent(eventId, eventJson)
         call.resolve(JSObject().put("accepted", accepted).put("eventId", eventId))
@@ -163,9 +164,92 @@ class NodicSyncPlugin : Plugin() {
             call.reject("batchJson is required", "INVALID_BATCH")
             return
         }
+        try {
+            val arr = JSONArray(batchJson)
+            PhaseZeroStore(context).use { store ->
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i)
+                    if (item != null) store.upsertWorkspaceEvent(item.toString())
+                }
+            }
+        } catch (_: Exception) {}
         val id = UUID.randomUUID().toString()
         val accepted = NodicSyncService.broadcastBatch(id, batchJson)
         call.resolve(JSObject().put("accepted", accepted).put("batchId", id))
+    }
+
+    @PluginMethod
+    fun saveWorkspaceChannel(call: PluginCall) {
+        val id = call.getString("id")
+        val name = call.getString("name")
+        if (id.isNullOrBlank() || name.isNullOrBlank()) {
+            call.reject("Channel id and name are required", "INVALID_CHANNEL")
+            return
+        }
+        val sessionId = call.getString("sessionId")?.takeIf { it.isNotBlank() } ?: "sess-${id.take(12)}"
+        val description = call.getString("description")
+        val leadDeviceId = call.getString("leadDeviceId") ?: "unknown"
+        val genesisEventId = call.getString("genesisEventId") ?: "genesis"
+        val keyVersion = call.getInt("keyVersion") ?: 1
+        val channelKey = call.getString("channelKey")
+        val isActive = call.getBoolean("isActive") ?: true
+
+        PhaseZeroStore(context).use { store ->
+            store.upsertWorkspaceChannel(
+                id = id,
+                sessionId = sessionId,
+                name = name,
+                description = description,
+                leadDeviceId = leadDeviceId,
+                genesisEventId = genesisEventId,
+                keyVersion = keyVersion,
+                channelKey = channelKey,
+                isActive = isActive,
+            )
+        }
+        call.resolve(JSObject().put("saved", true).put("id", id).put("sessionId", sessionId))
+    }
+
+    @PluginMethod
+    fun setActiveWorkspaceChannel(call: PluginCall) {
+        val channelId = call.getString("channelId")
+        PhaseZeroStore(context).use { store ->
+            store.setActiveWorkspaceChannel(channelId)
+        }
+        call.resolve(JSObject().put("updated", true))
+    }
+
+    @PluginMethod
+    fun saveWorkspaceEvent(call: PluginCall) {
+        val eventJson = call.getString("eventJson")
+        if (eventJson.isNullOrBlank()) {
+            call.reject("eventJson is required", "INVALID_EVENT")
+            return
+        }
+        val saved = PhaseZeroStore(context).use { store ->
+            store.upsertWorkspaceEvent(eventJson)
+        }
+        call.resolve(JSObject().put("saved", saved))
+    }
+
+    @PluginMethod
+    fun getWorkspaceBackup(call: PluginCall) {
+        val channelId = call.getString("channelId")
+        PhaseZeroStore(context).use { store ->
+            val channels = jsonArrayToJsArray(store.getWorkspaceChannels())
+            val events = jsonArrayToJsArray(store.getWorkspaceEvents(channelId, 1000))
+            call.resolve(
+                JSObject()
+                    .put("channels", channels)
+                    .put("events", events),
+            )
+        }
+    }
+
+    @PluginMethod
+    fun clearWorkspaceData(call: PluginCall) {
+        PhaseZeroStore(context).use { it.clearWorkspaceData() }
+        call.resolve(JSObject().put("cleared", true))
     }
 
     @PluginMethod
@@ -230,6 +314,46 @@ class NodicSyncPlugin : Plugin() {
             val connected = NodicSyncService.connectToPeer(host, port)
             call.resolve(JSObject().put("connected", connected).put("host", host).put("port", port))
         }
+    }
+
+    @PluginMethod
+    fun sendPairingRequest(call: PluginCall) {
+        val host = call.getString("host")?.trim()
+        val port = call.getInt("port") ?: 0
+        val requestId = call.getString("requestId") ?: UUID.randomUUID().toString()
+        if (host.isNullOrBlank() || port <= 0) {
+            call.reject("Valid host and port are required", "INVALID_ENDPOINT")
+            return
+        }
+        pluginExecutor.execute {
+            val sent = NodicSyncService.sendPairingRequest(host, port, requestId)
+            call.resolve(JSObject().put("sent", sent).put("requestId", requestId))
+        }
+    }
+
+    @PluginMethod
+    fun sendPairingResponse(call: PluginCall) {
+        val host = call.getString("host")?.trim()
+        val port = call.getInt("port") ?: 0
+        val requestId = call.getString("requestId") ?: UUID.randomUUID().toString()
+        val accepted = call.getBoolean("accepted") ?: false
+        if (host.isNullOrBlank() || port <= 0) {
+            call.reject("Valid host and port are required", "INVALID_ENDPOINT")
+            return
+        }
+        pluginExecutor.execute {
+            val sent = NodicSyncService.sendPairingResponse(host, port, requestId, accepted)
+            call.resolve(JSObject().put("sent", sent).put("requestId", requestId).put("accepted", accepted))
+        }
+    }
+
+    @PluginMethod
+    fun disconnectPeerLocally(call: PluginCall) {
+        val peerDeviceId = call.getString("peerDeviceId")?.trim()
+        if (!peerDeviceId.isNullOrBlank()) {
+            NodicSyncService.disconnectPeerLocally(peerDeviceId)
+        }
+        call.resolve(JSObject().put("disconnected", true))
     }
 
     @PluginMethod
@@ -347,6 +471,18 @@ class NodicSyncPlugin : Plugin() {
         fun emitLogAdded(logJson: JSONObject) {
             try {
                 instance.get()?.emit("syncLogAdded", JSObject.fromJSONObject(logJson))
+            } catch (_: Exception) {}
+        }
+
+        fun emitPairingRequest(reqJson: JSONObject) {
+            try {
+                instance.get()?.emit("pairingRequestReceived", JSObject.fromJSONObject(reqJson))
+            } catch (_: Exception) {}
+        }
+
+        fun emitPairingResponse(respJson: JSONObject) {
+            try {
+                instance.get()?.emit("pairingResponseReceived", JSObject.fromJSONObject(respJson))
             } catch (_: Exception) {}
         }
 
