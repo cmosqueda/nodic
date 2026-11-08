@@ -35,6 +35,7 @@ export interface Message {
 
 export interface Channel {
   id: string;
+  sessionId?: string;
   name: string;
   description: string | null;
   currentUserDeviceId: string;
@@ -45,6 +46,7 @@ export interface Channel {
 
 export interface ChannelSummary {
   id: string;
+  sessionId?: string;
   name: string;
   description: string | null;
   leadDeviceId?: string;

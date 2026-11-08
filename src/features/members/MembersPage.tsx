@@ -17,6 +17,7 @@ export function MembersPage() {
     identity,
     createInvitation,
     joinChannelWithCode,
+    recoverChannelSession,
     updateMemberRole,
     removeMember,
   } = useWorkspace();
@@ -170,9 +171,21 @@ export function MembersPage() {
         <div className="channel-header-chip">
           <div>
             <strong>{channel.name}</strong>
-            <small>Authorized Members</small>
+            <small>
+              Authorized Members · Session:{' '}
+              <span style={{ fontFamily: 'monospace' }}>
+                {channel.sessionId ?? `sess-${channel.id.slice(0, 8)}`}
+              </span>
+            </small>
           </div>
           <div style={{ display: 'flex', gap: '8px' }}>
+            <button
+              className="dialog-btn-outline"
+              onClick={() => void recoverChannelSession(channel.sessionId ?? channel.id)}
+              title="Re-sync channel session with connected peers"
+            >
+              Sync
+            </button>
             <button className="dialog-btn-outline" onClick={() => setShowJoinModal(true)}>
               <IonIcon icon={enterOutline} style={{ marginRight: '4px', verticalAlign: 'middle' }} />
               Join

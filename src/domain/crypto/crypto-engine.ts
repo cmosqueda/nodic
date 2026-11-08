@@ -84,6 +84,28 @@ export async function generateDeviceKeyPair(): Promise<{
 }
 
 /**
+ * Exports a CryptoKey ECDSA P-256 private key to JSON Web Key (JWK) string for local persistence.
+ */
+export async function exportPrivateSigningKey(privateKey: CryptoKey): Promise<string> {
+  const jwk = await crypto.subtle.exportKey('jwk', privateKey);
+  return JSON.stringify(jwk);
+}
+
+/**
+ * Imports a persisted ECDSA P-256 private key from JWK JSON string.
+ */
+export async function importPrivateSigningKey(jwkJson: string): Promise<CryptoKey> {
+  const jwk = JSON.parse(jwkJson) as JsonWebKey;
+  return crypto.subtle.importKey(
+    'jwk',
+    jwk,
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign'],
+  );
+}
+
+/**
  * Imports an EC P-256 public signing key from string format (`p256:<spki-base64>`).
  */
 export async function importPublicSigningKey(publicKeyStr: string): Promise<CryptoKey> {

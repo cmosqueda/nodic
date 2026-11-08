@@ -36,6 +36,24 @@ export interface BatteryOptimizationStatus {
   model?: string;
 }
 
+export interface NativeWorkspaceChannelBackup {
+  id: string;
+  sessionId: string;
+  name: string;
+  description: string | null;
+  leadDeviceId: string;
+  genesisEventId: string;
+  keyVersion: number;
+  channelKey: string | null;
+  isActive: boolean;
+  createdAt: number;
+}
+
+export interface NativeWorkspaceBackup {
+  channels: NativeWorkspaceChannelBackup[];
+  events: NodicEvent[];
+}
+
 interface NodicSyncPlugin {
   getStatus(): Promise<SyncStatus>;
   start(options: { displayName: string; deviceId?: string; publicKey?: string }): Promise<SyncStatus>;
@@ -43,6 +61,22 @@ interface NodicSyncPlugin {
   publishEvent(options: { eventJson: string }): Promise<{ accepted: boolean; eventId: string }>;
   publishBatch(options: { batchJson: string }): Promise<{ accepted: boolean; batchId: string }>;
   publishSummary(options: { summaryJson: string }): Promise<{ accepted: boolean }>;
+  saveWorkspaceChannel(options: {
+    id: string;
+    sessionId: string;
+    name: string;
+    description?: string | null;
+    leadDeviceId: string;
+    genesisEventId: string;
+    keyVersion?: number;
+    channelKey?: string | null;
+    isActive?: boolean;
+    createdAt?: number;
+  }): Promise<{ saved: boolean; id: string; sessionId: string }>;
+  setActiveWorkspaceChannel(options: { channelId: string | null }): Promise<{ updated: boolean }>;
+  saveWorkspaceEvent(options: { eventJson: string }): Promise<{ saved: boolean }>;
+  getWorkspaceBackup(options?: { channelId?: string }): Promise<NativeWorkspaceBackup>;
+  clearWorkspaceData(): Promise<{ cleared: boolean }>;
   getDeviceIdentity(options?: { displayName?: string }): Promise<NativeDeviceIdentity>;
   syncDeviceIdentity(options: {
     deviceId: string;
@@ -50,6 +84,18 @@ interface NodicSyncPlugin {
     publicKey: string;
   }): Promise<NativeDeviceIdentity>;
   connectPeer(options: { host: string; port: number }): Promise<{ connected: boolean; host: string; port: number }>;
+  sendPairingRequest(options: {
+    host: string;
+    port: number;
+    requestId: string;
+  }): Promise<{ sent: boolean; requestId: string }>;
+  sendPairingResponse(options: {
+    host: string;
+    port: number;
+    requestId: string;
+    accepted: boolean;
+  }): Promise<{ sent: boolean; requestId: string; accepted: boolean }>;
+  disconnectPeerLocally(options: { peerDeviceId: string }): Promise<{ disconnected: boolean }>;
   getDiagnostics(): Promise<NativeDiagnosticsSnapshot>;
   clearLogs(): Promise<{ cleared: boolean }>;
   runProbe(): Promise<ProbeResult>;
@@ -82,6 +128,33 @@ interface NodicSyncPlugin {
   addListener(
     eventName: 'deepLinkOpened',
     listener: (data: DeepLinkData) => void,
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'pairingRequestReceived',
+    listener: (data: {
+      requestId: string;
+      fromDeviceId: string;
+      fromNodicId: string;
+      fromDisplayName: string;
+      fromPublicKey: string;
+      host: string;
+      port: number;
+      sentAt: string;
+    }) => void,
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'pairingResponseReceived',
+    listener: (data: {
+      requestId: string;
+      fromDeviceId: string;
+      fromNodicId: string;
+      fromDisplayName: string;
+      fromPublicKey: string;
+      host: string;
+      port: number;
+      accepted: boolean;
+      sentAt: string;
+    }) => void,
   ): Promise<PluginListenerHandle>;
 }
 
@@ -160,6 +233,48 @@ export const nativeSync = {
     return { connected: true, host, port };
   },
 
+  async sendPairingRequest(
+    host: string,
+    port: number,
+    requestId: string,
+  ): Promise<{ sent: boolean; requestId: string }> {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        return await nativePlugin.sendPairingRequest({ host, port, requestId });
+      } catch {
+        return { sent: false, requestId };
+      }
+    }
+    return { sent: true, requestId };
+  },
+
+  async sendPairingResponse(
+    host: string,
+    port: number,
+    requestId: string,
+    accepted: boolean,
+  ): Promise<{ sent: boolean; requestId: string; accepted: boolean }> {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        return await nativePlugin.sendPairingResponse({ host, port, requestId, accepted });
+      } catch {
+        return { sent: false, requestId, accepted };
+      }
+    }
+    return { sent: true, requestId, accepted };
+  },
+
+  async disconnectPeerLocally(peerDeviceId: string): Promise<{ disconnected: boolean }> {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        return await nativePlugin.disconnectPeerLocally({ peerDeviceId });
+      } catch {
+        return { disconnected: false };
+      }
+    }
+    return { disconnected: true };
+  },
+
   async getDiagnostics(): Promise<NativeDiagnosticsSnapshot> {
     if (Capacitor.isNativePlatform()) {
       return nativePlugin.getDiagnostics();
@@ -202,6 +317,71 @@ export const nativeSync = {
       });
     }
     return { accepted: true };
+  },
+
+  async saveWorkspaceChannel(options: {
+    id: string;
+    sessionId: string;
+    name: string;
+    description?: string | null;
+    leadDeviceId: string;
+    genesisEventId: string;
+    keyVersion?: number;
+    channelKey?: string | null;
+    isActive?: boolean;
+    createdAt?: number;
+  }): Promise<{ saved: boolean; id: string; sessionId: string }> {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        return await nativePlugin.saveWorkspaceChannel(options);
+      } catch {
+        return { saved: false, id: options.id, sessionId: options.sessionId };
+      }
+    }
+    return { saved: true, id: options.id, sessionId: options.sessionId };
+  },
+
+  async setActiveWorkspaceChannel(channelId: string | null): Promise<void> {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        await nativePlugin.setActiveWorkspaceChannel({ channelId });
+      } catch {}
+    }
+  },
+
+  async saveWorkspaceEvent(event: NodicEvent): Promise<boolean> {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        const res = await nativePlugin.saveWorkspaceEvent({ eventJson: JSON.stringify(event) });
+        return res.saved;
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  },
+
+  async getWorkspaceBackup(channelId?: string): Promise<NativeWorkspaceBackup> {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        const backup = await nativePlugin.getWorkspaceBackup(channelId ? { channelId } : {});
+        return {
+          channels: backup?.channels ?? [],
+          events: backup?.events ?? [],
+        };
+      } catch {
+        return { channels: [], events: [] };
+      }
+    }
+    return { channels: [], events: [] };
+  },
+
+  async clearWorkspaceData(): Promise<void> {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        await nativePlugin.clearWorkspaceData();
+      } catch {}
+    }
   },
 
   runProbe(): Promise<ProbeResult> {

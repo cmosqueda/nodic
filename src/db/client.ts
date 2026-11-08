@@ -22,7 +22,16 @@ export async function openNodicDatabase(): Promise<NodicDatabase> {
     : await sqlite.createConnection('nodic', false, 'no-encryption', 1, false);
 
   if (!(await connection.isDBOpen()).result) await connection.open();
-  await connection.execute('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;', false);
+  try {
+    await connection.query('PRAGMA journal_mode = WAL;');
+  } catch {
+    // Ignore if WAL pragma returns cursor or is unsupported on device
+  }
+  try {
+    await connection.execute('PRAGMA foreign_keys = ON;', false);
+  } catch {
+    // Ignore pragma errors
+  }
 
   const db = drizzle<typeof schema>(async (sql, params, method) => {
     if (method === 'run') {

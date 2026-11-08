@@ -1,6 +1,7 @@
 import { type PropsWithChildren } from 'react';
 import { IonIcon } from '@ionic/react';
 import { closeOutline } from 'ionicons/icons';
+export { BottomSheet, type BottomSheetProps } from './BottomSheet';
 
 interface ModalProps {
   isOpen: boolean;

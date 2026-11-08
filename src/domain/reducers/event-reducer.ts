@@ -47,12 +47,18 @@ export function applyEventToState(
       const payload = event.payload as {
         name?: string;
         description?: string;
+        sessionId?: string;
         leadDisplayName?: string;
         leadPublicKey?: string;
       };
       state.channel.name = payload.name ?? state.channel.name;
       state.channel.description = payload.description ?? null;
       state.channel.leadDeviceId = event.authorDeviceId;
+      if (payload.sessionId) {
+        state.channel.sessionId = payload.sessionId;
+      } else if (!state.channel.sessionId) {
+        state.channel.sessionId = `sess-${event.channelId.slice(0, 12)}`;
+      }
       const effectiveLeadName = payload.leadDisplayName ?? author?.displayName ?? event.authorDeviceId.slice(0, 8);
       const lead: Member = {
         deviceId: event.authorDeviceId,
@@ -73,14 +79,20 @@ export function applyEventToState(
         deviceId: string;
         displayName: string;
         publicSigningKey?: string;
+        publicKey?: string;
         role?: MemberRole;
       };
       const existing = state.members.get(payload.deviceId);
+      const resolvedRole: MemberRole =
+        existing?.role === 'LEAD' || payload.deviceId === state.channel.leadDeviceId
+          ? 'LEAD'
+          : (payload.role ?? existing?.role ?? 'MEMBER');
       const member: Member = {
         deviceId: payload.deviceId,
         displayName: payload.displayName,
-        publicSigningKey: payload.publicSigningKey ?? existing?.publicSigningKey,
-        role: payload.role ?? existing?.role ?? 'MEMBER',
+        publicSigningKey:
+          payload.publicSigningKey ?? payload.publicKey ?? existing?.publicSigningKey,
+        role: resolvedRole,
         presence: existing?.presence ?? 'ONLINE',
         initials: payload.displayName.slice(0, 2).toUpperCase(),
       };

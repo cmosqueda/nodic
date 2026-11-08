@@ -31,17 +31,34 @@ export function generateJoinSecret(): string {
 export function createInvitationPayload(options: {
   channelId: string;
   expiresInHours?: number;
+  sessionId?: string;
+  channelName?: string;
+  channelDescription?: string | null;
+  leadDeviceId?: string;
+  leadDisplayName?: string;
+  leadPublicKey?: string;
+  leadEndpoint?: string | null;
 }): ChannelInvitation {
   const hours = options.expiresInHours ?? 24;
   const expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
 
-  return {
+  const payload: ChannelInvitation = {
     version: 1,
     channelId: options.channelId,
     invitationId: crypto.randomUUID(),
     joinSecret: generateJoinSecret(),
     expiresAt,
   };
+
+  if (options.sessionId) payload.sessionId = options.sessionId;
+  if (options.channelName) payload.channelName = options.channelName;
+  if (options.channelDescription !== undefined) payload.channelDescription = options.channelDescription;
+  if (options.leadDeviceId) payload.leadDeviceId = options.leadDeviceId;
+  if (options.leadDisplayName) payload.leadDisplayName = options.leadDisplayName;
+  if (options.leadPublicKey) payload.leadPublicKey = options.leadPublicKey;
+  if (options.leadEndpoint) payload.leadEndpoint = options.leadEndpoint;
+
+  return payload;
 }
 
 export function encodeInvitationCode(invitation: ChannelInvitation): string {

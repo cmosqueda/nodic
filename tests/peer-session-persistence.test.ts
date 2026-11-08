@@ -171,4 +171,359 @@ describe('Two-Peer Identity, Session, Log & Event Synchronization', () => {
       expect.arrayContaining(['Alice Lead', 'Bob Member']),
     );
   });
+
+  it('retains channel, Kanban tasks, chat messages, member list, and recoverable sessionId across app restarts when offline', async () => {
+    // 1. Channel Lead creates channel, tasks, and chat messages
+    const leadRepo1 = new NodicRepository();
+    await leadRepo1.init('Alice Lead');
+    const leadId = await leadRepo1.getIdentity();
+
+    const { snapshot: createdSnap } = await leadRepo1.createChannel(
+      'Release Command',
+      'Offline-first mobile release coordination',
+    );
+    const channelId = createdSnap.channel!.id;
+    const sessionId = createdSnap.channel!.sessionId!;
+    expect(sessionId).toMatch(/^sess-/);
+
+    const taskId = crypto.randomUUID();
+    await leadRepo1.commitLocalEvent(
+      channelId,
+      'TASK_CREATED',
+      {
+        id: taskId,
+        title: 'Verify APK LAN sync',
+        description: 'Ensure Device A and Device B sync bidirectionally',
+        status: 'TODO',
+        priority: 'HIGH',
+        assigneeDeviceId: leadId.deviceId,
+      },
+      taskId,
+    );
+
+    await leadRepo1.commitLocalEvent(
+      channelId,
+      'TASK_STATUS_CHANGED',
+      { taskId, status: 'IN_PROGRESS' },
+      taskId,
+    );
+
+    const msgId = crypto.randomUUID();
+    await leadRepo1.commitLocalEvent(channelId, 'CHAT_MESSAGE_SENT', {
+      messageId: msgId,
+      body: 'Channel lead initialized board; standing by for team.',
+    });
+
+    // 2. Simulate app closed & removed from Recents (completely new NodicRepository instance, offline)
+    const leadRepoAfterRestart = new NodicRepository();
+    const restoredSnap = await leadRepoAfterRestart.init();
+
+    expect(restoredSnap.channel).not.toBeNull();
+    expect(restoredSnap.channel!.id).toBe(channelId);
+    expect(restoredSnap.channel!.sessionId).toBe(sessionId);
+    expect(restoredSnap.channel!.name).toBe('Release Command');
+    expect(restoredSnap.channel!.members).toHaveLength(1);
+    expect(restoredSnap.channel!.members[0].displayName).toBe('Alice Lead');
+    expect(restoredSnap.channel!.members[0].role).toBe('LEAD');
+
+    expect(restoredSnap.tasks).toHaveLength(1);
+    expect(restoredSnap.tasks[0].id).toBe(taskId);
+    expect(restoredSnap.tasks[0].title).toBe('Verify APK LAN sync');
+    expect(restoredSnap.tasks[0].status).toBe('IN_PROGRESS');
+
+    expect(restoredSnap.messages.some((m) => m.body.includes('Channel lead initialized board'))).toBe(
+      true,
+    );
+
+    // 3. Simulate session cut-off (leaveChannel) and recovery by sessionId
+    await leadRepoAfterRestart.leaveChannel();
+    const recoveredSnap = await leadRepoAfterRestart.recoverChannelSession(sessionId);
+    expect(recoveredSnap.channel).not.toBeNull();
+    expect(recoveredSnap.channel!.id).toBe(channelId);
+    expect(recoveredSnap.channel!.sessionId).toBe(sessionId);
+    expect(recoveredSnap.tasks).toHaveLength(1);
+    expect(recoveredSnap.tasks[0].status).toBe('IN_PROGRESS');
+  });
+
+  it('synchronizes bidirectionally (Device A <-> Device B) when Device B joins via Device A invite code', async () => {
+    const { parseInvitationCode } = await import('../src/domain/invitations/invitation-codec');
+
+    // Device A (Lead) creates channel, a Kanban task, and a chat message before Device B joins
+    const repoA = new NodicRepository();
+    await repoA.init('Device A Lead');
+    const idA = await repoA.getIdentity();
+
+    const { snapshot: snapA0 } = await repoA.createChannel('Field Mesh Alpha', 'Two-device sync test');
+    const channelId = snapA0.channel!.id;
+    const sessionId = snapA0.channel!.sessionId!;
+
+    const taskAId = crypto.randomUUID();
+    await repoA.commitLocalEvent(
+      channelId,
+      'TASK_CREATED',
+      {
+        id: taskAId,
+        title: 'Task from Device A',
+        description: 'Created by Lead before Device B joined',
+        status: 'TODO',
+        priority: 'MEDIUM',
+      },
+      taskAId,
+    );
+
+    await repoA.commitLocalEvent(channelId, 'CHAT_MESSAGE_SENT', {
+      messageId: crypto.randomUUID(),
+      body: 'Hello from Device A!',
+    });
+
+    const inviteCode = await repoA.createInvitation(channelId, 24, '192.168.1.10:42110');
+    const parsedInvite = parseInvitationCode(inviteCode);
+    expect(parsedInvite.success).toBe(true);
+    if (!parsedInvite.success) return;
+    expect(parsedInvite.invitation.sessionId).toBe(sessionId);
+    expect(parsedInvite.invitation.channelName).toBe('Field Mesh Alpha');
+    expect(parsedInvite.invitation.leadDeviceId).toBe(idA.deviceId);
+    expect(parsedInvite.invitation.leadPublicKey).toBe(idA.publicSigningKey);
+
+    // Device B (Joiner) initializes and joins using Device A's invite code
+    const repoB = new NodicRepository();
+    await repoB.init('Device B Member');
+    const idB = await repoB.getIdentity();
+
+    await repoB.joinChannel(
+      parsedInvite.invitation.channelId,
+      parsedInvite.invitation.channelName,
+      parsedInvite.invitation.leadDeviceId,
+      {
+        description: parsedInvite.invitation.channelDescription ?? null,
+        sessionId: parsedInvite.invitation.sessionId,
+        leadDisplayName: parsedInvite.invitation.leadDisplayName,
+        leadPublicKey: parsedInvite.invitation.leadPublicKey,
+      },
+    );
+
+    const { event: bJoinEvent } = await repoB.commitLocalEvent(
+      channelId,
+      'MEMBER_ADDED',
+      {
+        deviceId: idB.deviceId,
+        displayName: idB.displayName,
+        role: 'MEMBER',
+        publicSigningKey: idB.publicSigningKey,
+        publicKey: idB.publicSigningKey,
+      },
+      idB.deviceId,
+    );
+
+    // Device B sends MEMBER_ADDED to Device A
+    await repoA.applyEvent(bJoinEvent);
+
+    // Bidirectional summary reconciliation: Device B sends its summary to Device A
+    const summaryB = await repoB.getSyncSummary(channelId);
+    const { eventsToSend: fromAToB } = await repoA.reconcileWithPeerSummary(
+      channelId,
+      idB.deviceId,
+      summaryB,
+    );
+    expect(fromAToB.length).toBeGreaterThanOrEqual(3); // CHANNEL_CREATED, TASK_CREATED, CHAT_MESSAGE_SENT
+
+    // Device B applies batch from Device A
+    const snapBAfterSync = await repoB.applyBatch(fromAToB);
+    expect(snapBAfterSync.channel?.name).toBe('Field Mesh Alpha');
+    expect(snapBAfterSync.channel?.sessionId).toBe(sessionId);
+    expect(snapBAfterSync.channel?.members.map((m) => m.displayName)).toEqual(
+      expect.arrayContaining(['Device A Lead', 'Device B Member']),
+    );
+    expect(snapBAfterSync.tasks.some((t) => t.title === 'Task from Device A')).toBe(true);
+    expect(snapBAfterSync.messages.some((m) => m.body === 'Hello from Device A!')).toBe(true);
+
+    // Now Device A sends a new task update and chat message to Device B, and Device B sends a message to Device A
+    const { event: aMoveTask } = await repoA.commitLocalEvent(
+      channelId,
+      'TASK_STATUS_CHANGED',
+      { taskId: taskAId, status: 'DONE' },
+      taskAId,
+    );
+    const { event: bChat } = await repoB.commitLocalEvent(channelId, 'CHAT_MESSAGE_SENT', {
+      messageId: crypto.randomUUID(),
+      body: 'Confirmed on Device B!',
+    });
+
+    const finalSnapB = await repoB.applyEvent(aMoveTask);
+    const finalSnapA = await repoA.applyEvent(bChat);
+
+    expect(finalSnapB.tasks.find((t) => t.id === taskAId)?.status).toBe('DONE');
+    expect(finalSnapA.tasks.find((t) => t.id === taskAId)?.status).toBe('DONE');
+    expect(finalSnapA.messages.some((m) => m.body === 'Confirmed on Device B!')).toBe(true);
+    expect(finalSnapB.messages.some((m) => m.body === 'Confirmed on Device B!')).toBe(true);
+  });
+
+  it('supports Bluetooth-style multi-peer pairing by Nodic User IDs, persistent saved connections, unilateral local disconnect, and re-pairing', async () => {
+    const { formatNodicId } = await import('../src/db/repository');
+
+    // Initialize User A, User B, and User C
+    const repoA = new NodicRepository();
+    await repoA.init('User A');
+    const idA = await repoA.getIdentity();
+    const nodicIdA = formatNodicId(idA.deviceId);
+
+    if (typeof localStorage !== 'undefined') localStorage.clear();
+    const repoB = new NodicRepository();
+    await repoB.init('User B');
+    const idB = await repoB.getIdentity();
+    const nodicIdB = formatNodicId(idB.deviceId);
+
+    if (typeof localStorage !== 'undefined') localStorage.clear();
+    const repoC = new NodicRepository();
+    await repoC.init('User C');
+    const idC = await repoC.getIdentity();
+    const nodicIdC = formatNodicId(idC.deviceId);
+
+    const nowIso = new Date().toISOString();
+
+    // User A discovers User B and User C as nearby devices on LAN
+    await repoA.savePeerIdentity({
+      deviceId: idB.deviceId,
+      displayName: idB.displayName,
+      publicSigningKey: idB.publicSigningKey,
+      serviceName: nodicIdB,
+      host: '192.168.1.21',
+      port: 42111,
+      status: 'ONLINE',
+      firstSeenAt: nowIso,
+      lastSeenAt: nowIso,
+    });
+    await repoA.savePeerIdentity({
+      deviceId: idC.deviceId,
+      displayName: idC.displayName,
+      publicSigningKey: idC.publicSigningKey,
+      serviceName: nodicIdC,
+      host: '192.168.1.22',
+      port: 42112,
+      status: 'ONLINE',
+      firstSeenAt: nowIso,
+      lastSeenAt: nowIso,
+    });
+
+    // 1. User A inputs User B's and User C's Nodic User IDs (plus a non-existent nearby ID)
+    const attemptResults = await repoA.requestPairingByNodicIds(
+      `${nodicIdB}, ${nodicIdC}, nodic-99999999`,
+    );
+    expect(attemptResults).toHaveLength(3);
+    expect(attemptResults[0].status).toBe('REQUEST_SENT');
+    expect(attemptResults[0].nodicId).toBe(nodicIdB);
+    expect(attemptResults[1].status).toBe('REQUEST_SENT');
+    expect(attemptResults[1].nodicId).toBe(nodicIdC);
+    expect(attemptResults[2].status).toBe('NOT_FOUND_NEARBY');
+
+    // User A's saved devices are currently PENDING_OUTBOUND
+    const pairedOnABeforeAccept = await repoA.listPairedDevices();
+    expect(pairedOnABeforeAccept).toHaveLength(2);
+    expect(
+      pairedOnABeforeAccept.find((d) => d.deviceId === idB.deviceId)?.pairingState,
+    ).toBe('PENDING_OUTBOUND');
+    expect(
+      pairedOnABeforeAccept.find((d) => d.deviceId === idC.deviceId)?.pairingState,
+    ).toBe('PENDING_OUTBOUND');
+
+    // 2. User B and User C receive User A's incoming connection requests and accept them
+    const reqOnB = await repoB.receiveIncomingPairingRequest({
+      requestId: attemptResults[0].request!.requestId,
+      fromDeviceId: idA.deviceId,
+      fromNodicId: nodicIdA,
+      fromDisplayName: idA.displayName,
+      fromPublicKey: idA.publicSigningKey,
+      host: '192.168.1.20',
+      port: 42110,
+    });
+    const respB = await repoB.respondToPairingRequest(reqOnB.requestId, true);
+    expect(respB.accepted).toBe(true);
+    expect(respB.pairedDevice?.pairingState).toBe('PAIRED');
+
+    const reqOnC = await repoC.receiveIncomingPairingRequest({
+      requestId: attemptResults[1].request!.requestId,
+      fromDeviceId: idA.deviceId,
+      fromNodicId: nodicIdA,
+      fromDisplayName: idA.displayName,
+      fromPublicKey: idA.publicSigningKey,
+      host: '192.168.1.20',
+      port: 42110,
+    });
+    const respC = await repoC.respondToPairingRequest(reqOnC.requestId, true);
+    expect(respC.accepted).toBe(true);
+    expect(respC.pairedDevice?.pairingState).toBe('PAIRED');
+
+    // 3. User A receives the PAIR_RESPONSE from User B and User C
+    await repoA.receivePairingResponse({
+      requestId: reqOnB.requestId,
+      fromDeviceId: idB.deviceId,
+      fromNodicId: nodicIdB,
+      fromDisplayName: idB.displayName,
+      fromPublicKey: idB.publicSigningKey,
+      host: '192.168.1.21',
+      port: 42111,
+      accepted: true,
+    });
+    await repoA.receivePairingResponse({
+      requestId: reqOnC.requestId,
+      fromDeviceId: idC.deviceId,
+      fromNodicId: nodicIdC,
+      fromDisplayName: idC.displayName,
+      fromPublicKey: idC.publicSigningKey,
+      host: '192.168.1.22',
+      port: 42112,
+      accepted: true,
+    });
+
+    // Verify all devices now have persistent saved connections in PAIRED state
+    const pairedOnA = await repoA.listPairedDevices();
+    expect(pairedOnA.find((d) => d.nodicId === nodicIdB)?.pairingState).toBe('PAIRED');
+    expect(pairedOnA.find((d) => d.nodicId === nodicIdC)?.pairingState).toBe('PAIRED');
+
+    const pairedOnB = await repoB.listPairedDevices();
+    expect(pairedOnB.find((d) => d.nodicId === nodicIdA)?.pairingState).toBe('PAIRED');
+
+    const pairedOnC = await repoC.listPairedDevices();
+    expect(pairedOnC.find((d) => d.nodicId === nodicIdA)?.pairingState).toBe('PAIRED');
+
+    // 4. Unilateral local disconnect: User A disconnects from User B
+    const disconnectedRecord = await repoA.disconnectPeerLocally(nodicIdB);
+    expect(disconnectedRecord?.pairingState).toBe('DISCONNECTED_LOCAL');
+
+    // Disconnection is ONLY recorded on User A's device; User B still sees User A as PAIRED
+    const pairedOnAAfterDisc = await repoA.listPairedDevices();
+    expect(
+      pairedOnAAfterDisc.find((d) => d.nodicId === nodicIdB)?.pairingState,
+    ).toBe('DISCONNECTED_LOCAL');
+    const pairedOnBAfterADisc = await repoB.listPairedDevices();
+    expect(
+      pairedOnBAfterADisc.find((d) => d.nodicId === nodicIdA)?.pairingState,
+    ).toBe('PAIRED');
+
+    // 5. Re-request and re-approve: User A resends connection request to User B and User B re-approves
+    const reconnectAttempt = await repoA.requestPairingByNodicIds([nodicIdB]);
+    expect(reconnectAttempt[0].status).toBe('REQUEST_SENT');
+
+    const reReqOnB = await repoB.receiveIncomingPairingRequest({
+      requestId: reconnectAttempt[0].request!.requestId,
+      fromDeviceId: idA.deviceId,
+      fromNodicId: nodicIdA,
+      fromDisplayName: idA.displayName,
+      fromPublicKey: idA.publicSigningKey,
+      host: '192.168.1.20',
+      port: 42110,
+    });
+    await repoB.respondToPairingRequest(reReqOnB.requestId, true);
+    const reconnectedOnA = await repoA.receivePairingResponse({
+      requestId: reReqOnB.requestId,
+      fromDeviceId: idB.deviceId,
+      fromNodicId: nodicIdB,
+      fromDisplayName: idB.displayName,
+      fromPublicKey: idB.publicSigningKey,
+      host: '192.168.1.21',
+      port: 42111,
+      accepted: true,
+    });
+    expect(reconnectedOnA.pairingState).toBe('PAIRED');
+  });
 });

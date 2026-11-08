@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { NodicEvent } from '../protocol/contracts';
 import { applyEventToState, createInitialMaterializedState } from '../src/domain/reducers/event-reducer';
+import { BOARD_COLUMNS, normalizeColumnStatus } from '../src/features/tasks/BoardPage';
 import type { Channel } from '../src/domain/models';
 
 function mockEvent(overrides: Partial<NodicEvent>): NodicEvent {
@@ -145,5 +146,66 @@ describe('Event Reducers & Projection Pipeline', () => {
     // Apply exact same message event again
     applyEventToState(state, chatEvent);
     expect(state.messages).toHaveLength(1);
+  });
+
+  it('supports non-linear Kanban task transitions across any columns (TODO <-> DONE <-> IN_PROGRESS)', () => {
+    const state = createInitialMaterializedState(initialChannel);
+    applyEventToState(
+      state,
+      mockEvent({
+        type: 'TASK_CREATED',
+        payload: { id: 'task-nonlinear', title: 'Non-linear card', status: 'TODO' },
+      }),
+    );
+
+    // Move directly from TODO to DONE (skipping IN_PROGRESS)
+    const toDone = mockEvent({
+      id: 'evt-nl-1',
+      type: 'TASK_STATUS_CHANGED',
+      entityId: 'task-nonlinear',
+      lamportClock: 2,
+      payload: { status: 'DONE' },
+    });
+    const res1 = applyEventToState(state, toDone);
+    expect(state.tasks.get('task-nonlinear')?.status).toBe('DONE');
+    expect(res1.generatedSystemMessage?.body).toContain('completed "Non-linear card"');
+
+    // Move backward from DONE directly to TODO
+    const backToTodo = mockEvent({
+      id: 'evt-nl-2',
+      type: 'TASK_STATUS_CHANGED',
+      entityId: 'task-nonlinear',
+      lamportClock: 3,
+      payload: { status: 'TODO' },
+    });
+    applyEventToState(state, backToTodo);
+    expect(state.tasks.get('task-nonlinear')?.status).toBe('TODO');
+
+    // Move from TODO to IN_PROGRESS, then back to TODO
+    const toInProgress = mockEvent({
+      id: 'evt-nl-3',
+      type: 'TASK_STATUS_CHANGED',
+      entityId: 'task-nonlinear',
+      lamportClock: 4,
+      payload: { status: 'IN_PROGRESS' },
+    });
+    applyEventToState(state, toInProgress);
+    expect(state.tasks.get('task-nonlinear')?.status).toBe('IN_PROGRESS');
+
+    const backToTodoAgain = mockEvent({
+      id: 'evt-nl-4',
+      type: 'TASK_STATUS_CHANGED',
+      entityId: 'task-nonlinear',
+      lamportClock: 5,
+      payload: { status: 'TODO' },
+    });
+    applyEventToState(state, backToTodoAgain);
+    expect(state.tasks.get('task-nonlinear')?.status).toBe('TODO');
+
+    // Verify board column helpers
+    expect(BOARD_COLUMNS.map((c) => c.status)).toEqual(['TODO', 'IN_PROGRESS', 'DONE']);
+    expect(normalizeColumnStatus('BLOCKED')).toBe('IN_PROGRESS');
+    expect(normalizeColumnStatus('BACKLOG')).toBe('TODO');
+    expect(normalizeColumnStatus('DONE')).toBe('DONE');
   });
 });

@@ -36,6 +36,13 @@ export const channelInvitationSchema = z.object({
   invitationId: z.string().min(1).max(128),
   joinSecret: z.string().min(32).max(512),
   expiresAt: z.iso.datetime(),
+  sessionId: z.string().min(1).max(128).optional(),
+  channelName: z.string().min(1).max(120).optional(),
+  channelDescription: z.string().max(500).nullable().optional(),
+  leadDeviceId: z.string().min(1).max(128).optional(),
+  leadDisplayName: z.string().min(1).max(80).optional(),
+  leadPublicKey: z.string().min(1).max(2048).optional(),
+  leadEndpoint: z.string().max(256).nullable().optional(),
 });
 export type ChannelInvitation = z.infer<typeof channelInvitationSchema>;
 
@@ -104,6 +111,42 @@ export const syncLogSchema = z.object({
 });
 export type SyncLog = z.infer<typeof syncLogSchema>;
 
+export const pairingStateSchema = z.enum([
+  'PENDING_OUTBOUND',
+  'PENDING_INBOUND',
+  'PAIRED',
+  'DISCONNECTED_LOCAL',
+  'DECLINED',
+]);
+export type PairingState = z.infer<typeof pairingStateSchema>;
+
+export const pairedDeviceSchema = z.object({
+  deviceId: z.string().min(1).max(128),
+  nodicId: z.string().min(1).max(64),
+  displayName: z.string().min(1).max(80),
+  publicSigningKey: z.string().min(1).max(2048),
+  host: z.string().min(1).max(256),
+  port: z.number().int().positive(),
+  pairingState: pairingStateSchema,
+  pairedAt: z.string(),
+  updatedAt: z.string(),
+});
+export type PairedDevice = z.infer<typeof pairedDeviceSchema>;
+
+export const pairingRequestSchema = z.object({
+  requestId: z.string().min(1).max(128),
+  fromDeviceId: z.string().min(1).max(128),
+  fromNodicId: z.string().min(1).max(64),
+  fromDisplayName: z.string().min(1).max(80),
+  fromPublicKey: z.string().min(1).max(2048),
+  host: z.string().min(1).max(256),
+  port: z.number().int().positive(),
+  direction: z.enum(['INBOUND', 'OUTBOUND']),
+  status: z.enum(['PENDING', 'ACCEPTED', 'DECLINED']),
+  createdAt: z.string(),
+});
+export type PairingRequest = z.infer<typeof pairingRequestSchema>;
+
 export const peerFrameSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('HELLO'),
@@ -145,6 +188,27 @@ export const peerFrameSchema = z.discriminatedUnion('kind', [
     reason: z.string().optional(),
     encryptedChannelKey: z.string().optional(),
     memberEvent: nodicEventSchema.optional(),
+  }),
+  z.object({
+    kind: z.literal('PAIR_REQUEST'),
+    requestId: z.string(),
+    fromDeviceId: z.string().min(1).max(128),
+    fromNodicId: z.string().min(1).max(64),
+    fromDisplayName: z.string().min(1).max(80),
+    fromPublicKey: z.string().min(1).max(2048),
+    listenPort: z.number().int().positive(),
+    sentAt: z.string(),
+  }),
+  z.object({
+    kind: z.literal('PAIR_RESPONSE'),
+    requestId: z.string(),
+    fromDeviceId: z.string().min(1).max(128),
+    fromNodicId: z.string().min(1).max(64),
+    fromDisplayName: z.string().min(1).max(80),
+    fromPublicKey: z.string().min(1).max(2048),
+    listenPort: z.number().int().positive(),
+    accepted: z.boolean(),
+    sentAt: z.string(),
   }),
   z.object({ kind: z.literal('ERROR'), requestId: z.string().optional(), code: z.string(), message: z.string() }),
 ]);
