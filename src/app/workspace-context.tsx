@@ -26,7 +26,12 @@ import {
   parseInvitationCode,
 } from '../domain/invitations/invitation-codec';
 import { filterPeersForRelay } from '../domain/sync/sync-engine';
-import { formatNodicId, repository, type PairingAttemptResult } from '../db/repository';
+import {
+  formatNodicId,
+  repository,
+  type JoinRequestRecord,
+  type PairingAttemptResult,
+} from '../db/repository';
 import { nativeSync } from '../services/native-sync';
 
 interface CreateTaskInput {
@@ -81,7 +86,26 @@ function friendlyJoinReason(reason?: string): string {
   }
 }
 
+/** A direct invitation another nearby lead sent to this device. */
+export interface IncomingInvite {
+  id: string;
+  code: string;
+  channelId: string;
+  channelName: string;
+  leadDeviceId: string;
+  leadName: string;
+  expiresAt: string;
+}
+
 interface WorkspaceActions {
+  joinRequests: JoinRequestRecord[];
+  incomingInvites: IncomingInvite[];
+  initError: string | null;
+  approveJoinRequest(requestId: string): Promise<void>;
+  declineJoinRequest(requestId: string): Promise<void>;
+  inviteNearbyPeer(deviceId: string): Promise<void>;
+  acceptIncomingInvite(inviteId: string): Promise<{ success: boolean; message: string }>;
+  dismissIncomingInvite(inviteId: string): void;
   pendingJoin: PendingJoin | null;
   cancelPendingJoin(): void;
   retryPendingJoin(): Promise<void>;
@@ -105,7 +129,8 @@ interface WorkspaceActions {
   resetDatabase(): Promise<void>;
   connectToPeer(host: string, port: number): Promise<boolean>;
   requestPairingByNodicIds(nodicIds: string | string[]): Promise<PairingAttemptResult[]>;
-  respondToPairingRequest(requestId: string, accept: boolean): Promise<void>;
+  /** `delivered` is false when the other phone could not be reached; it is re-sent automatically. */
+  respondToPairingRequest(requestId: string, accept: boolean): Promise<{ delivered: boolean }>;
   disconnectPeerLocally(peerDeviceIdOrNodicId: string): Promise<void>;
   refreshNetworkDiagnostics(): Promise<void>;
   clearSyncLogs(): Promise<void>;
@@ -142,8 +167,21 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
   const [pairingRequests, setPairingRequests] = useState<PairingRequest[]>([]);
   const [syncLogs, setSyncLogs] = useState<SyncLog[]>([]);
   const [isReady, setIsReady] = useState(false);
+  const isReadyRef = useRef(false);
   const activeChannelIdRef = useRef<string | null>(null);
   activeChannelIdRef.current = workspace.channel?.id ?? null;
+  isReadyRef.current = isReady;
+
+  const [joinRequests, setJoinRequests] = useState<JoinRequestRecord[]>([]);
+  const [incomingInvites, setIncomingInvites] = useState<IncomingInvite[]>([]);
+  const [initError, setInitError] = useState<string | null>(null);
+  const refreshJoinRequests = () => setJoinRequests(repository.listJoinRequests());
+
+  // Drop requests whose invitation expired while the lead was looking at the list.
+  useEffect(() => {
+    const t = setInterval(() => setJoinRequests(repository.listJoinRequests()), 30_000);
+    return () => clearInterval(t);
+  }, []);
 
   const [pendingJoin, setPendingJoinState] = useState<PendingJoin | null>(null);
   const pendingJoinRef = useRef<PendingJoin | null>(null);
@@ -219,6 +257,68 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         });
       }
     }, JOIN_ANSWER_TIMEOUT_MS);
+  };
+
+  /**
+   * Lead side: admit a queued applicant - consume the invite, tell the applicant first (so it creates
+   * the channel), then send membership + history. Throws a readable Error on failure.
+   */
+  const admitApplicant = async (requestId: string) => {
+    const res = await repository.approveJoinRequest(requestId);
+    refreshJoinRequests();
+    if (!res.request) throw new Error(res.reason ?? 'This request is no longer pending.');
+    const applicantId = res.request.applicantDeviceId;
+    if (!res.accepted || !res.memberEvent) {
+      const rejection = await repository.buildJoinResponseEvent(res.request.channelId, applicantId, {
+        accepted: false,
+        reason: res.reason ?? 'Join request declined',
+      });
+      void nativeSync.publishEvent(rejection, [applicantId]);
+      throw new Error(friendlyJoinReason(res.reason));
+    }
+    const channelId = res.request.channelId;
+    const acceptance = await repository.buildJoinResponseEvent(channelId, applicantId, { accepted: true });
+    await nativeSync.publishEvent(acceptance, [applicantId]).catch(() => undefined);
+    await refreshChannels();
+    if (activeChannelIdRef.current === channelId) {
+      setWorkspace(await repository.loadWorkspace(channelId));
+    }
+    await syncIdentityState();
+    const recipients = repository.getChannelRecipientIds(channelId);
+    void nativeSync.publishEvent(res.memberEvent, recipients);
+    const history = await repository.getAllChannelEvents(channelId, 200);
+    if (history.length > 0) void nativeSync.publishBatch(history, [applicantId]);
+    const summary = await repository.getSyncSummary(channelId);
+    void nativeSync.publishSummary(channelId, summary, recipients);
+  };
+
+  /** Applicant side: a lead invited this device directly. */
+  const handleChannelInvite = async (event: NodicEvent, peerId: string) => {
+    const self = await repository.getIdentity();
+    const payload = event.payload as { targetDeviceId?: string; code?: string };
+    if (payload.targetDeviceId !== self.deviceId || !payload.code) return;
+    const parsed = parseInvitationCode(payload.code);
+    if (!parsed.success) return;
+    const inv = parsed.invitation;
+    // Only the lead named in the code may send it, and it must really come from that device.
+    if (!inv.leadDeviceId || inv.leadDeviceId !== event.authorDeviceId || inv.leadDeviceId !== peerId) return;
+    if ((await repository.listChannels()).some((c) => c.id === inv.channelId)) return;
+    setIncomingInvites((prev) =>
+      prev.some((i) => i.id === inv.invitationId)
+        ? prev
+        : [
+            ...prev,
+            {
+              id: inv.invitationId,
+              code: payload.code!,
+              channelId: inv.channelId,
+              channelName: inv.channelName ?? 'Channel',
+              leadDeviceId: inv.leadDeviceId!,
+              leadName: inv.leadDisplayName ?? 'A channel lead',
+              expiresAt: inv.expiresAt,
+            },
+          ],
+    );
   };
 
   /** Applicant side: the lead's answer to our join request. */
@@ -304,6 +404,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
 
   useEffect(() => {
     let unmounted = false;
+    const pairingCleanups: Array<() => void> = [];
 
     async function init() {
       try {
@@ -344,7 +445,10 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         }
       } catch (err) {
         console.error('Failed to init workspace repository:', err);
-        if (!unmounted) setIsReady(true);
+        if (!unmounted) {
+          setInitError(err instanceof Error ? err.message : 'Nodic could not load its local data.');
+          setIsReady(true);
+        }
       }
     }
 
@@ -358,38 +462,43 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
           // A prospective member proving itself with an invite code: only the lead acts on it.
           if (event.type === 'JOIN_REQUESTED') {
             void (async () => {
-              const res = await repository.handleIncomingJoinRequest(event);
               const applicant = [event.authorDeviceId];
-              if (!res.accepted) {
+              const outcome = await repository.receiveJoinRequest(event);
+              if (outcome.status === 'REJECTED') {
                 const rejection = await repository.buildJoinResponseEvent(
                   event.channelId,
                   event.authorDeviceId,
-                  { accepted: false, reason: res.reason ?? 'Join request declined' },
+                  { accepted: false, reason: outcome.reason },
                 );
                 void nativeSync.publishEvent(rejection, applicant);
                 return;
               }
-              // Tell the applicant first so it creates the channel before history arrives.
-              const acceptance = await repository.buildJoinResponseEvent(
-                event.channelId,
-                event.authorDeviceId,
-                { accepted: true },
-              );
-              await nativeSync.publishEvent(acceptance, applicant).catch(() => undefined);
-              if (unmounted) return;
-              await refreshChannels();
-              if (activeChannelIdRef.current === event.channelId) {
-                const refreshed = await repository.loadWorkspace(event.channelId);
-                if (!unmounted) setWorkspace(refreshed);
+              if (outcome.status === 'ALREADY_MEMBER') {
+                // Lost reply: re-send acceptance and history, no new invite consumed.
+                const acceptance = await repository.buildJoinResponseEvent(
+                  event.channelId,
+                  event.authorDeviceId,
+                  { accepted: true },
+                );
+                await nativeSync.publishEvent(acceptance, applicant).catch(() => undefined);
+                const history = await repository.getAllChannelEvents(event.channelId, 200);
+                if (history.length > 0) void nativeSync.publishBatch(history, applicant);
+                return;
               }
-              await syncIdentityState();
-              const recipients = repository.getChannelRecipientIds(event.channelId);
-              if (res.memberEvent) void nativeSync.publishEvent(res.memberEvent, recipients);
-              const history = await repository.getAllChannelEvents(event.channelId, 200);
-              if (history.length > 0) void nativeSync.publishBatch(history, applicant);
-              const summary = await repository.getSyncSummary(event.channelId);
-              void nativeSync.publishSummary(event.channelId, summary, recipients);
+              if (unmounted) return;
+              refreshJoinRequests();
+              // Invited directly by this lead: no second approval needed.
+              if (outcome.request.invitedDirectly) {
+                await admitApplicant(outcome.request.requestId).catch((err) =>
+                  console.warn('Direct-invite admission failed:', err),
+                );
+              }
             })();
+            return;
+          }
+
+          if (event.type === 'CHANNEL_INVITE') {
+            void handleChannelInvite(event, data.peerId);
             return;
           }
 
@@ -459,6 +568,28 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         } catch (error) {
           console.warn('Failed to process incoming peer summary:', error);
         }
+      });
+
+      // Pool pairing state: pick up what the native layer recorded while the UI wasn't listening,
+      // and keep re-offering our pending requests to peers that are (or come) nearby.
+      const syncPairing = async () => {
+        if (unmounted || !isReadyRef.current) return; // wait for the initial load
+        try {
+          const changed = await repository.mergeNativePairingState();
+          const resent = await repository.retryPendingOutboundPairings();
+          if (changed || resent > 0) await refreshDiagnosticsState();
+        } catch (err) {
+          console.warn('Pairing sync failed:', err);
+        }
+      };
+      const pairingTimer = setInterval(() => void syncPairing(), 8000);
+      const onVisible = () => {
+        if (document.visibilityState === 'visible') void syncPairing();
+      };
+      document.addEventListener('visibilitychange', onVisible);
+      pairingCleanups.push(() => {
+        clearInterval(pairingTimer);
+        document.removeEventListener('visibilitychange', onVisible);
       });
 
       const statusListener = nativeSync.plugin.addListener('statusChanged', (status) => {
@@ -561,6 +692,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
 
       return () => {
         unmounted = true;
+        pairingCleanups.forEach((fn) => fn());
         void eventListener.then((h) => h.remove());
         void summaryListener.then((h) => h.remove());
         void statusListener.then((h) => h.remove());
@@ -576,6 +708,118 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
       unmounted = true;
     };
   }, []);
+
+  const createInvitationCode = async (expiresInHours = 24): Promise<string> => {
+        if (!workspace.channel) throw new Error('No active channel');
+        const currentUser = workspace.channel.members.find(
+          (m) => m.deviceId === workspace.channel?.currentUserDeviceId,
+        );
+        if (currentUser?.role !== 'LEAD') {
+          throw new Error('Only the channel lead can create invitations');
+        }
+
+        const idRecord = await repository.getIdentity();
+        let leadEndpoint: string | undefined;
+        try {
+          const status = await nativeSync.getStatus();
+          if (
+            status.localEndpoint &&
+            status.localEndpoint !== '0.0.0.0:0' &&
+            !status.localEndpoint.startsWith('0.0.0.0')
+          ) {
+            leadEndpoint = status.localEndpoint;
+          }
+        } catch {}
+
+        const invitation = createInvitationPayload({
+          channelId: workspace.channel.id,
+          sessionId: workspace.channel.sessionId ?? `sess-${workspace.channel.id.slice(0, 8)}`,
+          channelName: workspace.channel.name,
+          channelDescription: workspace.channel.description ?? undefined,
+          leadDeviceId: workspace.channel.leadDeviceId ?? idRecord.deviceId,
+          leadDisplayName: idRecord.displayName,
+          leadPublicKey: idRecord.publicSigningKey,
+          leadEndpoint,
+          expiresInHours,
+        });
+        const code = encodeInvitationCode(invitation);
+
+        await repository.registerInvitation({
+          invitationId: invitation.invitationId,
+          joinSecret: invitation.joinSecret,
+          expiresAt: invitation.expiresAt,
+          channelId: workspace.channel.id,
+        });
+
+        // The join secret itself must never enter the event log or travel over the network
+        const { event } = await repository.commitLocalEvent(
+          workspace.channel.id,
+          'INVITATION_CREATED',
+          {
+            channelId: invitation.channelId,
+            invitationId: invitation.invitationId,
+            expiresAt: invitation.expiresAt,
+          },
+          invitation.invitationId,
+        );
+
+        await syncIdentityState();
+        await refreshDiagnosticsState();
+        void nativeSync.publishEvent(event, toMembers(event.channelId));
+        return code;
+      };
+
+  const joinWithCode = async (
+    code: string,
+    displayName?: string,
+  ): Promise<{ success: boolean; message: string }> => {
+          const parsed = parseInvitationCode(code);
+          if (!parsed.success) {
+            return { success: false, message: parsed.error };
+          }
+          const invitation = parsed.invitation;
+          const leadDeviceId = invitation.leadDeviceId;
+          if (!leadDeviceId) {
+            return { success: false, message: 'This invitation does not identify a channel lead.' };
+          }
+          const self = await repository.getIdentity();
+          if (leadDeviceId === self.deviceId) {
+            return { success: false, message: 'This is your own invite code. Share it with a teammate.' };
+          }
+          if (channels.some((c) => c.id === invitation.channelId)) {
+            return { success: false, message: 'You are already in this channel.' };
+          }
+          const inFlight = pendingJoinRef.current;
+          if (inFlight && (inFlight.status === 'CONNECTING' || inFlight.status === 'WAITING')) {
+            return { success: false, message: 'A join request is already in progress.' };
+          }
+
+          if (displayName?.trim()) {
+            await repository.updateDisplayName(displayName.trim());
+            await syncIdentityState();
+          }
+
+          // Nothing is stored locally until the lead admits us (see handleJoinResponse).
+          pendingInviteRef.current = {
+            invitationId: invitation.invitationId,
+            joinSecret: invitation.joinSecret,
+            options: {
+              description: invitation.channelDescription ?? null,
+              sessionId: invitation.sessionId,
+              leadDisplayName: invitation.leadDisplayName,
+              leadPublicKey: invitation.leadPublicKey,
+            },
+          };
+          setPending({
+            channelId: invitation.channelId,
+            channelName: invitation.channelName ?? 'Channel',
+            leadDeviceId,
+            leadName: invitation.leadDisplayName ?? 'the channel lead',
+            status: 'CONNECTING',
+          });
+          void startJoinAttempt();
+          return { success: true, message: 'Connecting to the channel lead...' };
+        };
 
   const value = useMemo<WorkspaceContextValue>(
     () => ({
@@ -714,6 +958,8 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
           const summary = await repository.getSyncSummary(workspace.channel.id);
           void nativeSync.publishSummary(workspace.channel.id, summary, toMembers(workspace.channel.id));
         }
+      
+        return { delivered: res.delivered };
       },
 
       async disconnectPeerLocally(peerDeviceIdOrNodicId: string) {
@@ -722,6 +968,9 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
       },
 
       async refreshNetworkDiagnostics() {
+        // A manual scan also re-pools pairing requests and re-offers pending ones.
+        await repository.mergeNativePairingState().catch(() => false);
+        await repository.retryPendingOutboundPairings().catch(() => 0);
         await refreshDiagnosticsState();
       },
 
@@ -853,64 +1102,76 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         void nativeSync.publishEvent(event, toMembers(event.channelId));
       },
 
-      async createInvitation(expiresInHours = 24) {
-        if (!workspace.channel) throw new Error('No active channel');
-        const currentUser = workspace.channel.members.find(
-          (m) => m.deviceId === workspace.channel?.currentUserDeviceId,
+      createInvitation: createInvitationCode,
+
+      joinRequests,
+      incomingInvites,
+      initError,
+
+      async approveJoinRequest(requestId) {
+        await admitApplicant(requestId);
+      },
+
+      async declineJoinRequest(requestId) {
+        const request = repository.declineJoinRequest(requestId);
+        refreshJoinRequests();
+        if (!request) return;
+        const rejection = await repository.buildJoinResponseEvent(
+          request.channelId,
+          request.applicantDeviceId,
+          { accepted: false, reason: 'The channel lead declined your request.' },
         );
-        if (currentUser?.role !== 'LEAD') {
-          throw new Error('Only the channel lead can create invitations');
+        void nativeSync.publishEvent(rejection, [request.applicantDeviceId]);
+      },
+
+      async inviteNearbyPeer(deviceId) {
+        const channel = workspace.channel;
+        if (!channel) throw new Error('Open a channel first.');
+        const me = channel.members.find((m) => m.deviceId === channel.currentUserDeviceId);
+        if (me?.role !== 'LEAD') throw new Error('Only the channel lead can invite people.');
+        if (channel.members.some((m) => m.deviceId === deviceId)) {
+          throw new Error('That person is already in this channel.');
+        }
+        // Re-check against fresh data: must be connected AND currently nearby on this network.
+        const [paired, peers] = await Promise.all([
+          repository.listPairedDevices(),
+          repository.listPeerIdentities(),
+        ]);
+        const device = paired.find((d) => d.deviceId === deviceId && d.pairingState === 'PAIRED');
+        if (!device) throw new Error('Connect to this person first (Network > Connect).');
+        const nearby = peers.some((p) => p.deviceId === deviceId && p.status === 'ONLINE');
+        if (!nearby) {
+          throw new Error(`${device.displayName} is not nearby right now. Check you are on the same Wi-Fi.`);
         }
 
-        const idRecord = await repository.getIdentity();
-        let leadEndpoint: string | undefined;
+        const code = await createInvitationCode(24);
+        const parsed = parseInvitationCode(code);
+        if (!parsed.success) throw new Error(parsed.error);
+        repository.markDirectInvite(parsed.invitation.invitationId, deviceId);
+
+        const inviteEvent = await repository.buildChannelInviteEvent(channel.id, deviceId, code);
+        let delivered = false;
         try {
-          const status = await nativeSync.getStatus();
-          if (
-            status.localEndpoint &&
-            status.localEndpoint !== '0.0.0.0:0' &&
-            !status.localEndpoint.startsWith('0.0.0.0')
-          ) {
-            leadEndpoint = status.localEndpoint;
-          }
-        } catch {}
+          delivered = (await nativeSync.publishEvent(inviteEvent, [deviceId])).accepted;
+        } catch {
+          delivered = false;
+        }
+        if (!delivered) {
+          repository.discardInvitation(parsed.invitation.invitationId);
+          throw new Error(`Couldn't reach ${device.displayName}. Make sure they have Nodic open and are nearby.`);
+        }
+      },
 
-        const invitation = createInvitationPayload({
-          channelId: workspace.channel.id,
-          sessionId: workspace.channel.sessionId ?? `sess-${workspace.channel.id.slice(0, 8)}`,
-          channelName: workspace.channel.name,
-          channelDescription: workspace.channel.description ?? undefined,
-          leadDeviceId: workspace.channel.leadDeviceId ?? idRecord.deviceId,
-          leadDisplayName: idRecord.displayName,
-          leadPublicKey: idRecord.publicSigningKey,
-          leadEndpoint,
-          expiresInHours,
-        });
-        const code = encodeInvitationCode(invitation);
+      async acceptIncomingInvite(inviteId) {
+        const invite = incomingInvites.find((i) => i.id === inviteId);
+        if (!invite) return { success: false, message: 'This invitation is no longer available.' };
+        const result = await joinWithCode(invite.code);
+        if (result.success) setIncomingInvites((prev) => prev.filter((i) => i.id !== inviteId));
+        return result;
+      },
 
-        await repository.registerInvitation({
-          invitationId: invitation.invitationId,
-          joinSecret: invitation.joinSecret,
-          expiresAt: invitation.expiresAt,
-          channelId: workspace.channel.id,
-        });
-
-        // The join secret itself must never enter the event log or travel over the network
-        const { event } = await repository.commitLocalEvent(
-          workspace.channel.id,
-          'INVITATION_CREATED',
-          {
-            channelId: invitation.channelId,
-            invitationId: invitation.invitationId,
-            expiresAt: invitation.expiresAt,
-          },
-          invitation.invitationId,
-        );
-
-        await syncIdentityState();
-        await refreshDiagnosticsState();
-        void nativeSync.publishEvent(event, toMembers(event.channelId));
-        return code;
+      dismissIncomingInvite(inviteId) {
+        setIncomingInvites((prev) => prev.filter((i) => i.id !== inviteId));
       },
 
       pendingJoin,
@@ -925,54 +1186,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
         await startJoinAttempt();
       },
 
-      async joinChannelWithCode(code, displayName) {
-        const parsed = parseInvitationCode(code);
-        if (!parsed.success) {
-          return { success: false, message: parsed.error };
-        }
-        const invitation = parsed.invitation;
-        const leadDeviceId = invitation.leadDeviceId;
-        if (!leadDeviceId) {
-          return { success: false, message: 'This invitation does not identify a channel lead.' };
-        }
-        const self = await repository.getIdentity();
-        if (leadDeviceId === self.deviceId) {
-          return { success: false, message: 'This is your own invite code. Share it with a teammate.' };
-        }
-        if (channels.some((c) => c.id === invitation.channelId)) {
-          return { success: false, message: 'You are already in this channel.' };
-        }
-        const inFlight = pendingJoinRef.current;
-        if (inFlight && (inFlight.status === 'CONNECTING' || inFlight.status === 'WAITING')) {
-          return { success: false, message: 'A join request is already in progress.' };
-        }
-
-        if (displayName?.trim()) {
-          await repository.updateDisplayName(displayName.trim());
-          await syncIdentityState();
-        }
-
-        // Nothing is stored locally until the lead admits us (see handleJoinResponse).
-        pendingInviteRef.current = {
-          invitationId: invitation.invitationId,
-          joinSecret: invitation.joinSecret,
-          options: {
-            description: invitation.channelDescription ?? null,
-            sessionId: invitation.sessionId,
-            leadDisplayName: invitation.leadDisplayName,
-            leadPublicKey: invitation.leadPublicKey,
-          },
-        };
-        setPending({
-          channelId: invitation.channelId,
-          channelName: invitation.channelName ?? 'Channel',
-          leadDeviceId,
-          leadName: invitation.leadDisplayName ?? 'the channel lead',
-          status: 'CONNECTING',
-        });
-        void startJoinAttempt();
-        return { success: true, message: 'Connecting to the channel lead...' };
-      },
+      joinChannelWithCode: joinWithCode,
 
       async updateMemberRole(deviceId, role) {
         if (!workspace.channel) return;
@@ -1034,6 +1248,9 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
       },
     }),
     [
+      joinRequests,
+      incomingInvites,
+      initError,
       pendingJoin,
       workspace,
       identity,

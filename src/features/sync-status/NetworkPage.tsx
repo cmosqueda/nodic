@@ -16,6 +16,7 @@ import type { PairingAttemptResult } from '../../db/repository';
 import { formatNodicId } from '../../db/repository';
 import { nativeSync } from '../../services/native-sync';
 import { useWorkspace } from '../../app/workspace-context';
+import { BusyButton, SkeletonRows, errorMessage, useFeedback } from '../../shared/feedback';
 
 export function NetworkPage() {
   const {
@@ -30,6 +31,9 @@ export function NetworkPage() {
     refreshNetworkDiagnostics,
   } = useWorkspace();
 
+  const feedback = useFeedback();
+  const [respondingId, setRespondingId] = useState<string | null>(null);
+  const [scanning, setScanning] = useState(false);
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [usernameInput, setUsernameInput] = useState('');
   const [savedNameNotice, setSavedNameNotice] = useState(false);
@@ -62,7 +66,8 @@ export function NetworkPage() {
   async function handleSaveUsername(e: FormEvent) {
     e.preventDefault();
     if (!usernameInput.trim()) return;
-    await updateDisplayName(usernameInput.trim());
+    const ok = await feedback.run(() => updateDisplayName(usernameInput.trim()));
+    if (!ok) return;
     setSavedNameNotice(true);
     setTimeout(() => setSavedNameNotice(false), 2500);
   }
@@ -74,24 +79,27 @@ export function NetworkPage() {
       setCopiedId(true);
       setTimeout(() => setCopiedId(false), 2000);
     } catch {
-      // Clipboard API may be unavailable in some webviews
+      feedback.error('Could not copy automatically. Select the ID and copy it manually.');
     }
   }
 
   async function startNetwork() {
-    const nextStatus = await nativeSync.start(
-      identity?.displayName ?? 'Nodic',
-      identity?.deviceId,
-      identity?.publicSigningKey,
-    );
-    setStatus(nextStatus);
-    await refreshNetworkDiagnostics();
+    await feedback.run(async () => {
+      const nextStatus = await nativeSync.start(
+        identity?.displayName ?? 'Nodic',
+        identity?.deviceId,
+        identity?.publicSigningKey,
+      );
+      setStatus(nextStatus);
+      await refreshNetworkDiagnostics();
+    }, { error: "Couldn't start discovery. Check Wi-Fi is on and Nodic has network permission." });
   }
 
   async function stopNetwork() {
-    const nextStatus = await nativeSync.stop();
-    setStatus(nextStatus);
-    await refreshNetworkDiagnostics();
+    await feedback.run(async () => {
+      setStatus(await nativeSync.stop());
+      await refreshNetworkDiagnostics();
+    });
   }
 
   async function handleSendPairingRequests(e: FormEvent) {
@@ -106,9 +114,30 @@ export function NetworkPage() {
       if (allSent) {
         setNodicIdsInput('');
       }
+    } catch (err) {
+      feedback.error(errorMessage(err, "Couldn't send the connection request."));
     } finally {
       setIsSendingRequest(false);
     }
+  }
+
+  async function respond(requestId: string, accept: boolean, name: string) {
+    setRespondingId(requestId);
+    await feedback.run(async () => {
+      const { delivered } = await respondToPairingRequest(requestId, accept);
+      if (!delivered) {
+        feedback.info(`Saved, but ${name} couldn't be reached yet. It will finish when they are nearby.`);
+      } else {
+        feedback.success(accept ? `Connected to ${name}` : `Declined ${name}`);
+      }
+    });
+    setRespondingId(null);
+  }
+
+  async function handleScan() {
+    setScanning(true);
+    await feedback.run(() => refreshNetworkDiagnostics(), { error: "Couldn't scan for nearby devices." });
+    setScanning(false);
   }
 
   async function handleQuickRequestPeer(nodicId: string) {
@@ -116,6 +145,8 @@ export function NetworkPage() {
     try {
       const results = await requestPairingByNodicIds([nodicId]);
       setPairingResults(results);
+    } catch (err) {
+      feedback.error(errorMessage(err, "Couldn't send the connection request."));
     } finally {
       setIsSendingRequest(false);
     }
@@ -169,10 +200,10 @@ export function NetworkPage() {
             <strong>Network</strong>
             <small>{summaryLine}</small>
           </div>
-          <button className="dialog-btn-outline" onClick={() => void refreshNetworkDiagnostics()}>
+          <BusyButton className="dialog-btn-outline" busy={scanning} busyLabel="Scanning" onClick={() => void handleScan()}>
             <IonIcon icon={refreshOutline} style={{ verticalAlign: 'middle', marginRight: '4px' }} />
             Scan
-          </button>
+          </BusyButton>
         </div>
 
         <div className="network-hub-grid">
@@ -196,17 +227,21 @@ export function NetworkPage() {
                       <code className="nodic-id-chip">{req.fromNodicId}</code>
                     </div>
                     <div style={{ display: 'flex', gap: '8px' }}>
-                      <button
+                      <BusyButton
                         type="button"
                         className="dialog-btn-primary"
-                        onClick={() => void respondToPairingRequest(req.requestId, true)}
+                        busy={respondingId === req.requestId}
+                        busyLabel="Accepting"
+                        disabled={respondingId !== null}
+                        onClick={() => void respond(req.requestId, true, req.fromDisplayName)}
                       >
                         Accept
-                      </button>
+                      </BusyButton>
                       <button
                         type="button"
                         className="dialog-btn-outline"
-                        onClick={() => void respondToPairingRequest(req.requestId, false)}
+                        disabled={respondingId !== null}
+                        onClick={() => void respond(req.requestId, false, req.fromDisplayName)}
                       >
                         Decline
                       </button>
@@ -224,7 +259,9 @@ export function NetworkPage() {
               <h3 style={{ margin: 0 }}>People nearby</h3>
             </div>
 
-            {people.length === 0 ? (
+            {people.length === 0 && status === null ? (
+              <SkeletonRows count={2} />
+            ) : people.length === 0 ? (
               <div className="network-empty-box">
                 No one found yet. Ask teammates to open Nodic on the same Wi-Fi or hotspot.
               </div>
@@ -252,7 +289,7 @@ export function NetworkPage() {
                         <button
                           type="button"
                           className="dialog-btn-outline"
-                          onClick={() => void disconnectPeerLocally(person.deviceId)}
+                          onClick={() => void feedback.run(() => disconnectPeerLocally(person.deviceId), { success: `Disconnected from ${person.name}` })}
                         >
                           <IonIcon icon={unlinkOutline} style={{ marginRight: '4px', verticalAlign: 'middle' }} />
                           Disconnect
@@ -277,7 +314,7 @@ export function NetworkPage() {
             {pairingResults.length > 0 && (
               <div style={{ display: 'grid', gap: '6px', marginTop: '12px' }}>
                 {pairingResults.map((res, idx) => {
-                  const isSuccess = res.status === 'REQUEST_SENT';
+                  const isSuccess = res.status === 'REQUEST_SENT' || res.status === 'ALREADY_PAIRED';
                   return (
                     <div
                       key={`${res.nodicId}-${idx}`}

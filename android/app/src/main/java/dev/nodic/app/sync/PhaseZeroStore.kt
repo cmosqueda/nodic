@@ -1002,12 +1002,18 @@ class PhaseZeroStore(private val appContext: Context) : SQLiteOpenHelper(appCont
      * joined (via invite code or by creating them) are dropped, so pairing alone never
      * grants channel membership. Join requests are transient and always pass through.
      */
+    private fun isTransientJoinEvent(type: String): Boolean =
+        type == "JOIN_REQUESTED" || type == "JOIN_ACCEPTED" || type == "JOIN_REJECTED" || type == "CHANNEL_INVITE"
+
     @Synchronized
     fun upsertRemoteWorkspaceEvent(eventJsonStr: String): Boolean {
         return try {
             val ev = JSONObject(eventJsonStr)
             val channelId = ev.optString("channelId")
             if (channelId.isBlank()) return false
+            // Transient join handshake events are forwarded to the app without being stored. The
+            // applicant has no local channel yet when the lead's answer arrives.
+            if (isTransientJoinEvent(ev.optString("type"))) return true
             if (!hasWorkspaceChannel(channelId)) return false
             upsertWorkspaceEvent(eventJsonStr)
         } catch (_: Exception) {
@@ -1027,7 +1033,7 @@ class PhaseZeroStore(private val appContext: Context) : SQLiteOpenHelper(appCont
             val type = ev.optString("type")
             if (id.isBlank() || channelId.isBlank() || type.isBlank()) return false
             // Join requests are transient and must never be persisted as channel history
-            if (type == "JOIN_REQUESTED") return true
+            if (isTransientJoinEvent(type)) return true
 
             val createdAtStr = ev.optString("createdAt")
             val createdAtMs = try {

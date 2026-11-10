@@ -455,6 +455,55 @@ class NodicSyncService : Service() {
                     )
                     NodicSyncPlugin.emitPeerIdentity(peerIdentityJson)
 
+                    // A repeat of a request we already answered (or from a device we already trust) is
+                    // answered again instead of being re-queued: this repairs a lost response without
+                    // resetting an accepted pairing back to "pending".
+                    val previous = store.getPairingRequest(requestId)
+                    val previousStatus = previous?.optString("status")
+                    // Trust a repeat only when it presents the same key we paired with; a different key
+                    // under a known device id is treated as a brand-new request the user must approve.
+                    val pairedKey = store.getPairedDevices(onlyPaired = true).let { arr ->
+                        (0 until arr.length()).map { arr.getJSONObject(it) }
+                            .firstOrNull { it.optString("deviceId") == remoteDeviceId }
+                            ?.optString("publicSigningKey")
+                    }
+                    val alreadyTrusted = pairedKey != null && pairedKey == remotePublicKey
+                    if ((previous != null && previousStatus != "PENDING") || alreadyTrusted) {
+                        val accept = if (previous != null && previousStatus != "PENDING") {
+                            previousStatus == "ACCEPTED"
+                        } else {
+                            true
+                        }
+                        if (previous == null) {
+                            store.upsertPairingRequest(
+                                requestId = requestId,
+                                fromDeviceId = remoteDeviceId,
+                                fromNodicId = remoteNodicId,
+                                fromDisplayName = remoteDisplayName,
+                                fromPublicKey = remotePublicKey,
+                                host = remoteHost,
+                                port = remoteListenPort,
+                                direction = "INBOUND",
+                                status = "PENDING",
+                            )
+                        }
+                        val ackDup = JSONObject()
+                            .put("kind", "ACK")
+                            .put("id", requestId)
+                            .put("deviceId", localIdentity.deviceId)
+                            .put("displayName", localIdentity.displayName)
+                            .put("publicKey", localIdentity.publicKey)
+                            .put("listenPort", listenPort)
+                        PrintWriter(client.getOutputStream(), true).println(ackDup.toString())
+                        // Reply on a separate connection once this one is closed
+                        Thread {
+                            try {
+                                sendPairingResponseFrame(remoteHost, remoteListenPort, requestId, accept)
+                            } catch (_: Exception) {}
+                        }.start()
+                        return
+                    }
+
                     // Persist the pending request natively so it survives app kills
                     store.upsertPairingRequest(
                         requestId = requestId,

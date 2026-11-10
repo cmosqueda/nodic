@@ -514,7 +514,8 @@ class NodicSyncPlugin : Plugin() {
         return jsArr
     }
 
-    private fun emit(name: String, payload: JSObject) = notifyListeners(name, payload)
+    private fun emit(name: String, payload: JSObject, retain: Boolean = false) =
+        notifyListeners(name, payload, retain)
 
     companion object {
         private var instance = WeakReference<NodicSyncPlugin>(null)
@@ -570,13 +571,13 @@ class NodicSyncPlugin : Plugin() {
 
         fun emitPairingRequest(reqJson: JSONObject) {
             try {
-                instance.get()?.emit("pairingRequestReceived", JSObject.fromJSONObject(reqJson))
+                instance.get()?.emit("pairingRequestReceived", JSObject.fromJSONObject(reqJson), retain = true)
             } catch (_: Exception) {}
         }
 
         fun emitPairingResponse(respJson: JSONObject) {
             try {
-                instance.get()?.emit("pairingResponseReceived", JSObject.fromJSONObject(respJson))
+                instance.get()?.emit("pairingResponseReceived", JSObject.fromJSONObject(respJson), retain = true)
             } catch (_: Exception) {}
         }
 

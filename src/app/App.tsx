@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, type ReactNode } from 'react';
 import { IonApp } from '@ionic/react';
 import { IonReactRouter } from '@ionic/react-router';
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
@@ -9,6 +9,7 @@ import { ChatPage } from '../features/chat/ChatPage';
 import { MembersPage } from '../features/members/MembersPage';
 import { NetworkPage } from '../features/sync-status/NetworkPage';
 import { nativeSync, type DeepLinkData } from '../services/native-sync';
+import { ErrorBoundary, FeedbackProvider, LoadingScreen } from '../shared/feedback';
 
 function DeepLinkAndRouteSync() {
   const location = useLocation();
@@ -53,10 +54,31 @@ function DeepLinkAndRouteSync() {
   return null;
 }
 
+/** Shows the splash until the local database is ready, and a recoverable error if it failed. */
+function ReadyGate({ children }: { children: ReactNode }) {
+  const { isReady, initError } = useWorkspace();
+  if (!isReady) return <LoadingScreen />;
+  if (initError) {
+    return (
+      <div className="nd-crash" role="alert">
+        <h3>Nodic couldn't load your data</h3>
+        <p>{initError}</p>
+        <button className="dialog-btn-primary" onClick={() => window.location.reload()}>
+          Reload app
+        </button>
+      </div>
+    );
+  }
+  return <>{children}</>;
+}
+
 export default function App() {
   return (
+    <ErrorBoundary>
     <IonApp>
+      <FeedbackProvider>
       <WorkspaceProvider>
+        <ReadyGate>
         <IonReactRouter>
           <DeepLinkAndRouteSync />
           <AppShell>
@@ -69,7 +91,10 @@ export default function App() {
             </Routes>
           </AppShell>
         </IonReactRouter>
+        </ReadyGate>
       </WorkspaceProvider>
+      </FeedbackProvider>
     </IonApp>
+    </ErrorBoundary>
   );
 }

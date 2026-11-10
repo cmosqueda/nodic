@@ -4,6 +4,7 @@ import { chatbubbleEllipsesOutline, peopleOutline, pulseOutline, gridOutline } f
 import { IonIcon } from '@ionic/react';
 import { useWorkspace } from '../app/workspace-context';
 import { Modal } from './Modal';
+import { BusyButton, useFeedback } from './feedback';
 
 const navItems = [
   { to: '/board', label: 'Board', icon: gridOutline },
@@ -37,6 +38,9 @@ export function AppShell({ children }: PropsWithChildren) {
   const [newChannelDesc, setNewChannelDesc] = useState('');
   const location = useLocation();
   const navRef = useRef<HTMLElement>(null);
+  const feedback = useFeedback();
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [creating, setCreating] = useState(false);
 
   // Publish the real bottom-bar height so page content can always scroll clear of it.
   useEffect(() => {
@@ -62,14 +66,22 @@ export function AppShell({ children }: PropsWithChildren) {
   async function handleSaveProfile(e: FormEvent) {
     e.preventDefault();
     if (!nameDraft.trim()) return;
-    await updateDisplayName(nameDraft.trim());
-    setShowProfileModal(false);
+    setSavingProfile(true);
+    const ok = await feedback.run(() => updateDisplayName(nameDraft.trim()), { success: 'Name updated' });
+    setSavingProfile(false);
+    if (ok) setShowProfileModal(false);
   }
 
   async function handleCreateChannelSubmit(e: FormEvent) {
     e.preventDefault();
     if (!newChannelName.trim()) return;
-    await createChannel(newChannelName.trim(), newChannelDesc.trim() || undefined);
+    setCreating(true);
+    const ok = await feedback.run(
+      () => createChannel(newChannelName.trim(), newChannelDesc.trim() || undefined),
+      { success: 'Channel created' },
+    );
+    setCreating(false);
+    if (!ok) return;
     setNewChannelName('');
     setNewChannelDesc('');
     setShowCreateModal(false);
@@ -140,7 +152,7 @@ export function AppShell({ children }: PropsWithChildren) {
                   key={ch.id}
                   className={`drawer-channel-btn ${isActive ? 'is-active' : ''}`}
                   onClick={() => {
-                    void switchChannel(ch.id);
+                    void feedback.run(() => switchChannel(ch.id), { error: "Couldn't open that channel." });
                     setDrawerOpen(false);
                   }}
                 >
@@ -287,9 +299,9 @@ export function AppShell({ children }: PropsWithChildren) {
             <button type="button" className="dialog-btn-outline" onClick={() => setShowCreateModal(false)}>
               Cancel
             </button>
-            <button type="submit" className="dialog-btn-primary" disabled={!newChannelName.trim()}>
+            <BusyButton type="submit" className="dialog-btn-primary" busy={creating} busyLabel="Creating" disabled={!newChannelName.trim()}>
               Create
-            </button>
+            </BusyButton>
           </div>
         </form>
       </Modal>
@@ -332,9 +344,9 @@ export function AppShell({ children }: PropsWithChildren) {
             <button type="button" className="dialog-btn-outline" onClick={() => setShowProfileModal(false)}>
               Cancel
             </button>
-            <button type="submit" className="dialog-btn-primary" disabled={!nameDraft.trim()}>
+            <BusyButton type="submit" className="dialog-btn-primary" busy={savingProfile} busyLabel="Saving" disabled={!nameDraft.trim()}>
               Save Name
-            </button>
+            </BusyButton>
           </div>
         </form>
       </Modal>

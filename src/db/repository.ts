@@ -79,9 +79,23 @@ export function parseNodicIdList(raw: string | string[]): string[] {
   return Array.from(unique);
 }
 
+/** A validated join request waiting for the channel lead's decision. */
+export interface JoinRequestRecord {
+  requestId: string;
+  channelId: string;
+  applicantDeviceId: string;
+  applicantDisplayName: string;
+  applicantNodicId: string;
+  applicantPublicKey: string;
+  invitationId: string;
+  joinProof: string;
+  invitedDirectly: boolean;
+  receivedAt: string;
+}
+
 export interface PairingAttemptResult {
   nodicId: string;
-  status: 'REQUEST_SENT' | 'ALREADY_PAIRED' | 'NOT_FOUND_NEARBY' | 'SELF_ID';
+  status: 'REQUEST_SENT' | 'ALREADY_PAIRED' | 'NOT_FOUND_NEARBY' | 'SELF_ID' | 'SEND_FAILED';
   peer?: PeerIdentity;
   request?: PairingRequest;
   message: string;
@@ -302,6 +316,10 @@ export class NodicRepository {
   private channelKeys = new Map<string, Map<number, string>>();
   private revokedAuthors = new Map<string, Set<string>>();
   private storedInvitations = new Map<string, { hash: string; expiresAt: string; channelId: string }>();
+  /** Invitations the lead sent directly to a specific nearby device (admitted without a second tap). */
+  private directInvites = new Map<string, string>();
+  /** Valid join requests waiting for the lead's decision, keyed by applicant device + channel. */
+  private pendingJoinRequests = new Map<string, JoinRequestRecord>();
   private activeChannelId: string | null = null;
   private eventQueue: Promise<unknown> = Promise.resolve();
 
@@ -1554,7 +1572,24 @@ export class NodicRepository {
       }
 
       const peerNodicId = formatNodicId(nearbyPeer.deviceId);
-      const requestId = crypto.randomUUID();
+      const existingPaired = this.memoryPairedDevices.get(nearbyPeer.deviceId);
+      if (existingPaired?.pairingState === 'PAIRED') {
+        results.push({
+          nodicId: peerNodicId,
+          status: 'ALREADY_PAIRED',
+          peer: nearbyPeer,
+          message: `Already connected to ${nearbyPeer.displayName}.`,
+        });
+        continue;
+      }
+
+      // Tapping Connect twice must not stack duplicate requests on the other phone: re-send the
+      // one that is still pending (same id) instead.
+      const pendingOutbound = Array.from(this.memoryPairingRequests.values()).find(
+        (r) =>
+          r.direction === 'OUTBOUND' && r.status === 'PENDING' && r.fromDeviceId === nearbyPeer.deviceId,
+      );
+      const requestId = pendingOutbound?.requestId ?? crypto.randomUUID();
       const request: PairingRequest = {
         requestId,
         fromDeviceId: nearbyPeer.deviceId,
@@ -1565,12 +1600,11 @@ export class NodicRepository {
         port: nearbyPeer.port,
         direction: 'OUTBOUND',
         status: 'PENDING',
-        createdAt: nowIso,
+        createdAt: pendingOutbound?.createdAt ?? nowIso,
       };
 
+      // Saved before sending: the native layer only honours a response to a request it knows.
       await this.savePairingRequest(request);
-
-      const existingPaired = this.memoryPairedDevices.get(nearbyPeer.deviceId);
       await this.savePairedDevice({
         deviceId: nearbyPeer.deviceId,
         nodicId: peerNodicId,
@@ -1583,7 +1617,38 @@ export class NodicRepository {
         updatedAt: nowIso,
       });
 
-      await nativeSync.sendPairingRequest(nearbyPeer.host, nearbyPeer.port, requestId);
+      const delivery = await nativeSync.sendPairingRequest(nearbyPeer.host, nearbyPeer.port, requestId);
+      if (!delivery.sent) {
+        // Don't claim success: roll back so the UI offers Connect again.
+        request.status = 'DECLINED';
+        await this.savePairingRequest(request);
+        await this.savePairedDevice({
+          deviceId: nearbyPeer.deviceId,
+          nodicId: peerNodicId,
+          displayName: nearbyPeer.displayName,
+          publicSigningKey: nearbyPeer.publicSigningKey,
+          host: nearbyPeer.host,
+          port: nearbyPeer.port,
+          pairingState: existingPaired?.pairingState ?? 'DECLINED',
+          pairedAt: existingPaired?.pairedAt ?? nowIso,
+          updatedAt: new Date().toISOString(),
+        });
+        await this.recordSyncLog({
+          level: 'WARN',
+          category: 'HANDSHAKE',
+          peerDeviceId: nearbyPeer.deviceId,
+          sessionId: requestId,
+          message: `Could not deliver pairing request to ${nearbyPeer.displayName}`,
+          detailsJson: JSON.stringify({ requestId, host: nearbyPeer.host, port: nearbyPeer.port }),
+        });
+        results.push({
+          nodicId: peerNodicId,
+          status: 'SEND_FAILED',
+          peer: nearbyPeer,
+          message: `Couldn't reach ${nearbyPeer.displayName}. Check you are on the same Wi-Fi and they have Nodic open.`,
+        });
+        continue;
+      }
 
       await this.recordSyncLog({
         level: 'INFO',
@@ -1637,6 +1702,10 @@ export class NodicRepository {
       lastSeenAt: nowIso,
     });
 
+    // A re-delivered request that was already answered keeps its answer (never resets to PENDING).
+    const already = this.memoryPairingRequests.get(payload.requestId);
+    if (already && already.status !== 'PENDING') return already;
+
     const req: PairingRequest = {
       requestId: payload.requestId,
       fromDeviceId: payload.fromDeviceId,
@@ -1647,12 +1716,27 @@ export class NodicRepository {
       port: payload.port,
       direction: 'INBOUND',
       status: 'PENDING',
-      createdAt: nowIso,
+      createdAt: already?.createdAt ?? nowIso,
     };
 
     await this.savePairingRequest(req);
 
+    // One pending request per device: a newer request supersedes older pending ones.
+    for (const other of this.memoryPairingRequests.values()) {
+      if (
+        other.requestId !== req.requestId &&
+        other.direction === 'INBOUND' &&
+        other.status === 'PENDING' &&
+        other.fromDeviceId === req.fromDeviceId
+      ) {
+        other.status = 'DECLINED';
+        await this.savePairingRequest(other);
+      }
+    }
+
     const existing = this.memoryPairedDevices.get(payload.fromDeviceId);
+    // An already-connected device re-asking must not be demoted and lose its sync.
+    if (existing?.pairingState === 'PAIRED') return req;
     await this.savePairedDevice({
       deviceId: payload.fromDeviceId,
       nodicId: fromNodicId,
@@ -1671,10 +1755,14 @@ export class NodicRepository {
   async respondToPairingRequest(
     requestId: string,
     accept: boolean,
-  ): Promise<{ accepted: boolean; pairedDevice?: PairedDevice }> {
+  ): Promise<{ accepted: boolean; delivered: boolean; pairedDevice?: PairedDevice }> {
     const req = this.memoryPairingRequests.get(requestId);
     if (!req) {
-      throw new Error('Pairing request not found');
+      throw new Error('This request is no longer available.');
+    }
+    if (req.status !== 'PENDING') {
+      const settled = this.memoryPairedDevices.get(req.fromDeviceId);
+      return { accepted: req.status === 'ACCEPTED', delivered: true, pairedDevice: settled };
     }
 
     const nowIso = new Date().toISOString();
@@ -1694,7 +1782,7 @@ export class NodicRepository {
       }
     }
 
-    await nativeSync.sendPairingResponse(req.host, req.port, req.requestId, accept);
+    const delivery = await nativeSync.sendPairingResponse(req.host, req.port, req.requestId, accept);
 
     const existing = this.memoryPairedDevices.get(req.fromDeviceId);
     const pairedDevice = await this.savePairedDevice({
@@ -1727,7 +1815,62 @@ export class NodicRepository {
       });
     }
 
-    return { accepted: accept, pairedDevice };
+    if (!delivery.sent) {
+      await this.recordSyncLog({
+        level: 'WARN',
+        category: 'HANDSHAKE',
+        peerDeviceId: req.fromDeviceId,
+        sessionId: req.requestId,
+        message: `Could not deliver pairing answer to ${req.fromDisplayName}; it will be re-sent when they ask again`,
+        detailsJson: JSON.stringify({ requestId: req.requestId, accepted: accept }),
+      });
+    }
+
+    return { accepted: accept, delivered: delivery.sent, pairedDevice };
+  }
+
+  /**
+   * Pulls pairing records the native layer changed while the web layer was not listening (app in the
+   * background, event fired before a listener attached) into the JS stores. Returns true if anything changed.
+   */
+  async mergeNativePairingState(): Promise<boolean> {
+    if (!Capacitor.isNativePlatform()) return false;
+    let changed = false;
+    const native = await nativeSync.getPairingState();
+    for (const d of native.pairedDevices) {
+      const cur = this.memoryPairedDevices.get(d.deviceId);
+      if (!cur || new Date(d.updatedAt).getTime() > new Date(cur.updatedAt).getTime()) {
+        await this.savePairedDevice(d);
+        changed = true;
+      }
+    }
+    for (const r of native.pairingRequests) {
+      const cur = this.memoryPairingRequests.get(r.requestId);
+      if (!cur || (cur.status === 'PENDING' && r.status !== 'PENDING')) {
+        await this.savePairingRequest(r);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  /**
+   * Re-sends still-pending outbound requests to peers that are currently nearby, so a request
+   * reaches a device that was asleep, out of range or had its app closed when first sent.
+   * The receiver treats a repeat of the same request id idempotently.
+   */
+  async retryPendingOutboundPairings(maxAgeMs = 10 * 60_000): Promise<number> {
+    const peers = await this.listPeerIdentities();
+    let resent = 0;
+    for (const req of this.memoryPairingRequests.values()) {
+      if (req.direction !== 'OUTBOUND' || req.status !== 'PENDING') continue;
+      if (Date.now() - new Date(req.createdAt).getTime() > maxAgeMs) continue;
+      const peer = peers.find((p) => p.deviceId === req.fromDeviceId && p.status === 'ONLINE');
+      if (!peer) continue;
+      const delivery = await nativeSync.sendPairingRequest(peer.host, peer.port, req.requestId);
+      if (delivery.sent) resent += 1;
+    }
+    return resent;
   }
 
   async receivePairingResponse(payload: {
@@ -2509,7 +2652,8 @@ export class NodicRepository {
     if (
       event.type === 'JOIN_REQUESTED' ||
       event.type === 'JOIN_ACCEPTED' ||
-      event.type === 'JOIN_REJECTED'
+      event.type === 'JOIN_REJECTED' ||
+      event.type === 'CHANNEL_INVITE'
     ) {
       return this.loadWorkspace();
     }
@@ -3298,7 +3442,7 @@ export class NodicRepository {
 
   private async buildTransientEvent(
     channelId: string,
-    type: 'JOIN_REQUESTED' | 'JOIN_ACCEPTED' | 'JOIN_REJECTED',
+    type: 'JOIN_REQUESTED' | 'JOIN_ACCEPTED' | 'JOIN_REJECTED' | 'CHANNEL_INVITE',
     payload: Record<string, unknown>,
   ): Promise<NodicEvent> {
     const identity = await this.getIdentity();
@@ -3326,6 +3470,15 @@ export class NodicRepository {
     return { ...eventWithoutSig, signature };
   }
 
+  /** Lead side: signed, transient direct invitation for one nearby device. Never stored in history. */
+  async buildChannelInviteEvent(
+    channelId: string,
+    targetDeviceId: string,
+    code: string,
+  ): Promise<NodicEvent> {
+    return this.buildTransientEvent(channelId, 'CHANNEL_INVITE', { targetDeviceId, code });
+  }
+
   /** Applicant side: stores the channel key delivered with an admission. */
   installChannelKey(channelId: string, version: number, key: string): void {
     this.setChannelKey(channelId, version, key);
@@ -3342,19 +3495,21 @@ export class NodicRepository {
   }
 
   /**
-   * Lead side: validates a JOIN_REQUESTED event against the stored invitation and, if valid,
-   * emits the signed MEMBER_ADDED event that actually admits the applicant.
+   * Lead side: structural + cryptographic checks shared by auto-admission and the approval queue.
+   * Does not consume the invitation.
    */
-  async handleIncomingJoinRequest(event: NodicEvent): Promise<{
-    accepted: boolean;
-    reason?: string;
-    memberEvent?: NodicEvent;
-    alreadyMember?: boolean;
-  }> {
+  private async validateJoinRequestEvent(event: NodicEvent): Promise<
+    | { ok: false; reason: string }
+    | {
+        ok: true;
+        alreadyMember: boolean;
+        applicant: { deviceId: string; displayName: string; publicKey: string; invitationId: string; joinProof: string };
+      }
+  > {
     const identity = await this.getIdentity();
     const state = this.memoryChannels.get(event.channelId);
     if (!state || state.channel.leadDeviceId !== identity.deviceId) {
-      return { accepted: false, reason: 'Only the channel lead can admit members' };
+      return { ok: false, reason: 'Only the channel lead can admit members' };
     }
     const payload = event.payload as {
       deviceId?: string;
@@ -3370,12 +3525,19 @@ export class NodicRepository {
       !payload.joinProof ||
       !payload.publicSigningKey
     ) {
-      return { accepted: false, reason: 'Malformed join request' };
+      return { ok: false, reason: 'Malformed join request' };
     }
+    const applicant = {
+      deviceId: payload.deviceId,
+      displayName: payload.displayName ?? `Node-${payload.deviceId.slice(0, 4).toUpperCase()}`,
+      publicKey: payload.publicSigningKey,
+      invitationId: payload.invitationId,
+      joinProof: payload.joinProof,
+    };
     // A current member re-sending a request (retry after a lost reply) is simply re-acknowledged
     // without consuming another invite.
     if (state.members.has(payload.deviceId) && !this.isAuthorRevoked(event.channelId, payload.deviceId)) {
-      return { accepted: true, alreadyMember: true };
+      return { ok: true, alreadyMember: true, applicant };
     }
     if (
       payload.publicSigningKey.startsWith('p256:') &&
@@ -3387,29 +3549,155 @@ export class NodicRepository {
       const validSig = await verifyEventSignature(event, payload.publicSigningKey);
       if (!validSig) {
         await this.quarantineRejectedEvent(event.id, event.authorDeviceId, 'INVALID_SIGNATURE');
-        return { accepted: false, reason: 'Invalid join request signature' };
+        return { ok: false, reason: 'Invalid join request signature' };
       }
     }
+    return { ok: true, alreadyMember: false, applicant };
+  }
+
+  private async logRejectedJoin(event: NodicEvent, reason?: string): Promise<void> {
+    const invitationId = (event.payload as { invitationId?: string }).invitationId;
+    await this.recordSyncLog({
+      level: 'WARN',
+      category: 'EVENT',
+      peerDeviceId: event.authorDeviceId,
+      sessionId: null,
+      message: `Rejected join request: ${reason ?? 'invalid invitation'}`,
+      detailsJson: JSON.stringify({ channelId: event.channelId, invitationId }),
+    });
+  }
+
+  /** Checks an invitation (exists, right channel, unexpired, correct secret) without consuming it. */
+  private async checkInvitation(
+    channelId: string,
+    invitationId: string,
+    joinProof: string,
+  ): Promise<string | null> {
+    const stored = this.storedInvitations.get(invitationId);
+    if (!stored || stored.channelId !== channelId) return 'Invitation not found for this channel';
+    if (new Date(stored.expiresAt).getTime() < Date.now()) return 'Invitation has expired';
+    if (!constantTimeCompare(joinProof, stored.hash)) return 'Invalid invitation secret';
+    return null;
+  }
+
+  /**
+   * Lead side (auto-admit): validates a JOIN_REQUESTED event against the stored invitation and,
+   * if valid, emits the signed MEMBER_ADDED event that actually admits the applicant.
+   */
+  async handleIncomingJoinRequest(event: NodicEvent): Promise<{
+    accepted: boolean;
+    reason?: string;
+    memberEvent?: NodicEvent;
+    alreadyMember?: boolean;
+  }> {
+    const checked = await this.validateJoinRequestEvent(event);
+    if (!checked.ok) return { accepted: false, reason: checked.reason };
+    if (checked.alreadyMember) return { accepted: true, alreadyMember: true };
+    const { applicant } = checked;
     const res = await this.processJoinRequest({
       channelId: event.channelId,
-      invitationId: payload.invitationId,
-      joinProof: payload.joinProof,
-      applicantDeviceId: payload.deviceId,
-      applicantDisplayName: payload.displayName ?? `Node-${payload.deviceId.slice(0, 4).toUpperCase()}`,
-      applicantPublicKey: payload.publicSigningKey,
+      invitationId: applicant.invitationId,
+      joinProof: applicant.joinProof,
+      applicantDeviceId: applicant.deviceId,
+      applicantDisplayName: applicant.displayName,
+      applicantPublicKey: applicant.publicKey,
     });
     if (!res.accepted) {
-      await this.recordSyncLog({
-        level: 'WARN',
-        category: 'EVENT',
-        peerDeviceId: event.authorDeviceId,
-        sessionId: null,
-        message: `Rejected join request: ${res.reason ?? 'invalid invitation'}`,
-        detailsJson: JSON.stringify({ channelId: event.channelId, invitationId: payload.invitationId }),
-      });
+      await this.logRejectedJoin(event, res.reason);
       return { accepted: false, reason: res.reason };
     }
     return { accepted: true, memberEvent: res.memberEvent };
+  }
+
+  /**
+   * Lead side (manual approval): validates a join request and parks it for the lead to approve
+   * or decline. Requests from devices the lead invited directly are flagged `invitedDirectly`.
+   */
+  async receiveJoinRequest(event: NodicEvent): Promise<
+    | { status: 'QUEUED'; request: JoinRequestRecord }
+    | { status: 'ALREADY_MEMBER' }
+    | { status: 'REJECTED'; reason: string }
+  > {
+    const checked = await this.validateJoinRequestEvent(event);
+    if (!checked.ok) return { status: 'REJECTED', reason: checked.reason };
+    if (checked.alreadyMember) return { status: 'ALREADY_MEMBER' };
+    const { applicant } = checked;
+    const invalid = await this.checkInvitation(event.channelId, applicant.invitationId, applicant.joinProof);
+    if (invalid) {
+      await this.logRejectedJoin(event, invalid);
+      return { status: 'REJECTED', reason: invalid };
+    }
+    const request: JoinRequestRecord = {
+      requestId: `${event.channelId}:${applicant.deviceId}`,
+      channelId: event.channelId,
+      applicantDeviceId: applicant.deviceId,
+      applicantDisplayName: applicant.displayName,
+      applicantNodicId: formatNodicId(applicant.deviceId),
+      applicantPublicKey: applicant.publicKey,
+      invitationId: applicant.invitationId,
+      joinProof: applicant.joinProof,
+      invitedDirectly: this.directInvites.get(applicant.invitationId) === applicant.deviceId,
+      receivedAt: new Date().toISOString(),
+    };
+    // A newer request from the same device replaces the older one (retry).
+    this.pendingJoinRequests.set(request.requestId, request);
+    return { status: 'QUEUED', request };
+  }
+
+  listJoinRequests(channelId?: string): JoinRequestRecord[] {
+    const now = Date.now();
+    const out: JoinRequestRecord[] = [];
+    for (const [id, r] of this.pendingJoinRequests) {
+      const inv = this.storedInvitations.get(r.invitationId);
+      if (!inv || new Date(inv.expiresAt).getTime() < now) {
+        this.pendingJoinRequests.delete(id); // invitation expired or was revoked/used meanwhile
+        continue;
+      }
+      if (!channelId || r.channelId === channelId) out.push(r);
+    }
+    return out.sort((a, b) => a.receivedAt.localeCompare(b.receivedAt));
+  }
+
+  /** Lead approves a queued request: consumes the invite and emits MEMBER_ADDED. */
+  async approveJoinRequest(
+    requestId: string,
+  ): Promise<{ accepted: boolean; reason?: string; request?: JoinRequestRecord; memberEvent?: NodicEvent }> {
+    const request = this.pendingJoinRequests.get(requestId);
+    if (!request) return { accepted: false, reason: 'This request is no longer pending.' };
+    const res = await this.processJoinRequest({
+      channelId: request.channelId,
+      invitationId: request.invitationId,
+      joinProof: request.joinProof,
+      applicantDeviceId: request.applicantDeviceId,
+      applicantDisplayName: request.applicantDisplayName,
+      applicantPublicKey: request.applicantPublicKey,
+    });
+    this.pendingJoinRequests.delete(requestId);
+    if (!res.accepted) return { accepted: false, reason: res.reason, request };
+    this.directInvites.delete(request.invitationId);
+    return { accepted: true, request, memberEvent: res.memberEvent };
+  }
+
+  /** Lead declines a queued request. The invite stays valid for someone else. */
+  declineJoinRequest(requestId: string): JoinRequestRecord | null {
+    const request = this.pendingJoinRequests.get(requestId) ?? null;
+    this.pendingJoinRequests.delete(requestId);
+    return request;
+  }
+
+  /**
+   * Lead side: creates an invitation meant for exactly one nearby device. The returned code is sent
+   * to that device only; its join request is then admitted without another approval step.
+   */
+  markDirectInvite(invitationId: string, deviceId: string): void {
+    this.directInvites.set(invitationId, deviceId);
+  }
+
+  /** Lead side: revokes an invitation (e.g. the direct send failed) so the code is unusable. */
+  discardInvitation(invitationId: string): void {
+    this.storedInvitations.delete(invitationId);
+    this.directInvites.delete(invitationId);
+    this.persistLocalWorkspaceState();
   }
 }
 

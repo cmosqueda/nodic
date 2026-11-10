@@ -1,3 +1,4 @@
+import { useFeedback } from '../../shared/feedback';
 import { useState, useRef, useEffect, type FormEvent } from 'react';
 import { IonIcon } from '@ionic/react';
 import { sendOutline } from 'ionicons/icons';
@@ -6,6 +7,7 @@ import { useWorkspace } from '../../app/workspace-context';
 
 export function ChatPage() {
   const { channel, identity, messages, sendMessage } = useWorkspace();
+  const feedback = useFeedback();
   const [draft, setDraft] = useState('');
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -16,8 +18,12 @@ export function ChatPage() {
   function submit(event: FormEvent) {
     event.preventDefault();
     if (!channel || !draft.trim()) return;
-    void sendMessage(draft.trim());
+    const text = draft.trim();
     setDraft('');
+    // Put the text back if sending failed so nothing the user typed is lost.
+    void feedback.run(() => sendMessage(text), { error: "Message wasn't sent. Please try again." }).then((ok) => {
+      if (!ok) setDraft((d) => d || text);
+    });
   }
 
   if (!channel) {

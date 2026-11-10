@@ -24,6 +24,7 @@ import { canAuthorEvent, canChangeTaskStatus } from '../../domain/permissions/pe
 import { useWorkspace } from '../../app/workspace-context';
 import { Modal } from '../../shared/Modal';
 import { BottomSheet } from '../../shared/BottomSheet';
+import { useFeedback } from '../../shared/feedback';
 
 interface ChannelMemberSelectorProps {
   members: Member[];
@@ -317,6 +318,7 @@ function TaskCard({
 
 export function BoardPage() {
   const { channel, tasks, createTask, moveTask, updateTask, archiveTask } = useWorkspace();
+  const feedback = useFeedback();
   const [showModal, setShowModal] = useState(false);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -412,12 +414,17 @@ export function BoardPage() {
     e.preventDefault();
     if (!title.trim()) return;
 
-    await createTask({
-      title: title.trim(),
-      description: description.trim() || undefined,
-      priority,
-      assigneeDeviceId: assigneeDeviceId || undefined,
-    });
+    const ok = await feedback.run(
+      () =>
+        createTask({
+          title: title.trim(),
+          description: description.trim() || undefined,
+          priority,
+          assigneeDeviceId: assigneeDeviceId || undefined,
+        }),
+      { success: 'Task created' },
+    );
+    if (!ok) return; // keep the form open so nothing is lost
 
     setTitle('');
     setDescription('');
@@ -430,19 +437,23 @@ export function BoardPage() {
     e.preventDefault();
     if (!selectedTask || !editTitle.trim()) return;
 
-    await updateTask(selectedTask.id, {
-      title: editTitle.trim(),
-      description: editDescription.trim() || null,
-      priority: editPriority,
-      assigneeDeviceId: editAssigneeId || null,
-    });
-    setIsEditingTask(false);
+    const ok = await feedback.run(
+      () =>
+        updateTask(selectedTask.id, {
+          title: editTitle.trim(),
+          description: editDescription.trim() || null,
+          priority: editPriority,
+          assigneeDeviceId: editAssigneeId || null,
+        }),
+      { success: 'Task updated' },
+    );
+    if (ok) setIsEditingTask(false);
   }
 
   async function handleArchiveSelectedTask() {
     if (!selectedTask) return;
-    await archiveTask(selectedTask.id);
-    handleCloseBottomSheet();
+    const ok = await feedback.run(() => archiveTask(selectedTask.id), { success: 'Task archived' });
+    if (ok) handleCloseBottomSheet();
   }
 
   function handleMoveTaskToStatus(taskId: string, targetStatus: TaskStatus) {
@@ -451,7 +462,7 @@ export function BoardPage() {
     if (normalizeColumnStatus(task.status) === targetStatus && task.status === targetStatus) {
       return;
     }
-    void moveTask(taskId, targetStatus);
+    void feedback.run(() => moveTask(taskId, targetStatus), { error: "Couldn't move the task. You may not have permission." });
   }
 
   function handleColumnDragOver(e: DragEvent<HTMLDivElement>, status: TaskStatus) {
