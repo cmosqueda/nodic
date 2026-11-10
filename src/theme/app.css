@@ -241,7 +241,8 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   display: flex;
   flex-direction: column;
   padding-top: calc(56px + max(12px, env(safe-area-inset-top)));
-  padding-bottom: calc(66px + max(12px, env(safe-area-inset-bottom)));
+  padding-bottom: calc(var(--nav-h) + 24px);
+  scroll-padding-bottom: calc(var(--nav-h) + 24px);
   padding-left: env(safe-area-inset-left);
   padding-right: env(safe-area-inset-right);
   background: var(--nodic-paper);
@@ -249,6 +250,7 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 
 .main-stage.is-chat-stage {
   overflow-y: hidden;
+  padding-bottom: calc(var(--nav-h) + 8px);
 }
 
 .screen-container {
@@ -390,6 +392,8 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 /* Standard Channel Header Chip (matching prototype) */
 .channel-header-chip {
   display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
   align-items: center;
   justify-content: space-between;
   border: 1px solid var(--nodic-line);
@@ -416,7 +420,7 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 /* Bottom Navigation Bar (Board | Chat | Members) */
 .mobile-nav {
   position: fixed !important;
-  z-index: 99999 !important;
+  z-index: 9000 !important;
   bottom: 0 !important;
   left: 0 !important;
   right: 0 !important;
@@ -1208,3 +1212,30 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   font-size: 12px;
   text-align: center;
 }
+
+/* Header actions wrap instead of overflowing on narrow phones */
+.channel-header-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* Join channel dialog + pending-join status */
+.join-form { display: grid; gap: 14px; }
+.join-form label { display: grid; gap: 6px; font-weight: 600; font-size: 13px; }
+.join-form input, .join-form textarea {
+  width: 100%; padding: 10px 12px; border-radius: 8px;
+  border: 1px solid var(--nodic-line); background: #fff; font: inherit;
+}
+.join-form .join-code { font-family: monospace; font-size: 12px; }
+.join-hint { color: var(--nodic-muted); font-size: 13px; margin: 0; }
+.join-msg { padding: 10px; border-radius: 8px; font-size: 13px; }
+.join-msg--error { background: #ffeef0; color: #b3261e; }
+.join-actions { display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap; }
+.join-pending {
+  display: grid; gap: 6px; text-align: left; padding: 12px 14px; margin-bottom: 14px;
+  border-radius: 12px; border: 1px solid #e8d48a; background: #fff8dc; color: #6b5200;
+}
+.join-pending small { font-size: 12px; }
+.join-pending.is-failed { border-color: #f0b4ba; background: #ffeef0; color: #8a1f17; }
+
+.network-tip { margin: 0; font-size: 12px; color: var(--nodic-muted); }
+.network-person-state { display: block; color: var(--nodic-muted); font-size: 12px; }
+.network-saved-note { display: flex; gap: 6px; align-items: center; color: #16a34a; font-size: 12px; font-weight: 600; margin-top: 8px; }
+.network-advanced summary { cursor: pointer; font-weight: 700; color: var(--nodic-signal); }

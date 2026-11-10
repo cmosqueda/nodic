@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useState } from 'react';
 import { IonIcon } from '@ionic/react';
 import {
   copyOutline,
@@ -10,13 +10,12 @@ import {
 import { Link } from 'react-router-dom';
 import { useWorkspace } from '../../app/workspace-context';
 import { Modal, ConfirmDialog } from '../../shared/Modal';
+import { JoinChannelModal, PendingJoinCard } from './JoinChannel';
 
 export function MembersPage() {
   const {
     channel,
-    identity,
     createInvitation,
-    joinChannelWithCode,
     recoverChannelSession,
     updateMemberRole,
     removeMember,
@@ -30,9 +29,6 @@ export function MembersPage() {
   const [copied, setCopied] = useState(false);
 
   const [showJoinModal, setShowJoinModal] = useState(false);
-  const [joinCodeInput, setJoinCodeInput] = useState('');
-  const [joinNameInput, setJoinNameInput] = useState('');
-  const [joinStatus, setJoinStatus] = useState<string | null>(null);
 
   const [memberToRemove, setMemberToRemove] = useState<{ deviceId: string; name: string } | null>(null);
 
@@ -58,29 +54,11 @@ export function MembersPage() {
     }
   }
 
-  async function handleJoinSubmit(e: FormEvent) {
-    e.preventDefault();
-    if (!joinCodeInput.trim()) return;
-
-    setJoinStatus('Validating invitation...');
-    const result = await joinChannelWithCode(joinCodeInput.trim(), joinNameInput.trim() || undefined);
-    if (result.success) {
-      setJoinStatus('Success! Entering channel...');
-      setTimeout(() => {
-        setShowJoinModal(false);
-        setJoinCodeInput('');
-        setJoinNameInput('');
-        setJoinStatus(null);
-      }, 1000);
-    } else {
-      setJoinStatus(`Error: ${result.message}`);
-    }
-  }
-
   if (!channel) {
     return (
       <div className="screen-container">
         <div className="page-wrap narrow-page" style={{ textAlign: 'center', paddingTop: '40px' }}>
+          <PendingJoinCard />
           <div
             className="hub-card"
             style={{
@@ -101,65 +79,13 @@ export function MembersPage() {
                 Join with Code
               </button>
               <Link to="/network">
-                <button className="dialog-btn-primary">Open Network Configuration</button>
+                <button className="dialog-btn-outline">Nearby people</button>
               </Link>
             </div>
           </div>
         </div>
 
-        {/* Join Channel Pure React Modal */}
-        <Modal
-          isOpen={showJoinModal}
-          onClose={() => setShowJoinModal(false)}
-          title="Join Channel"
-        >
-          <form
-            onSubmit={(e) => void handleJoinSubmit(e)}
-            style={{ display: 'grid', gap: '14px' }}
-          >
-            <p style={{ color: 'var(--nodic-muted)', fontSize: '13px', margin: '0 0 6px' }}>
-              Paste the invitation code received from your channel lead.
-            </p>
-
-            <div>
-              <label style={{ display: 'block', marginBottom: '6px', fontWeight: 600, fontSize: '13px' }}>Your Display Name</label>
-              <input
-                type="text"
-                value={joinNameInput}
-                onChange={(e) => setJoinNameInput(e.target.value)}
-                placeholder={identity?.displayName || 'e.g. Rocket Puncher'}
-                style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: '1px solid var(--nodic-line)', background: 'white' }}
-              />
-            </div>
-
-            <div>
-              <label style={{ display: 'block', marginBottom: '6px', fontWeight: 600, fontSize: '13px' }}>Invitation Code *</label>
-              <textarea
-                rows={3}
-                required
-                value={joinCodeInput}
-                onChange={(e) => setJoinCodeInput(e.target.value)}
-                placeholder="nodic:v1:..."
-                style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: '1px solid var(--nodic-line)', background: 'white', fontFamily: 'monospace', fontSize: '12px' }}
-              />
-            </div>
-
-            {joinStatus && (
-              <div style={{ padding: '10px', borderRadius: '8px', background: joinStatus.startsWith('Error') ? '#ffeef0' : '#eaf8f4', color: joinStatus.startsWith('Error') ? '#b3261e' : '#146c54', fontSize: '13px' }}>
-                {joinStatus}
-              </div>
-            )}
-
-            <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', marginTop: '8px' }}>
-              <button type="button" className="dialog-btn-outline" onClick={() => setShowJoinModal(false)}>
-                Cancel
-              </button>
-              <button type="submit" className="dialog-btn-primary" disabled={!joinCodeInput.trim()}>
-                Submit
-              </button>
-            </div>
-          </form>
-        </Modal>
+        <JoinChannelModal isOpen={showJoinModal} onClose={() => setShowJoinModal(false)} />
       </div>
     );
   }
@@ -167,6 +93,7 @@ export function MembersPage() {
   return (
     <div className="screen-container">
       <div className="page-wrap narrow-page">
+        <PendingJoinCard />
         {/* Header Chip matching wireframe prototype */}
         <div className="channel-header-chip">
           <div>
@@ -178,7 +105,7 @@ export function MembersPage() {
               </span>
             </small>
           </div>
-          <div style={{ display: 'flex', gap: '8px' }}>
+          <div className="channel-header-actions">
             <button
               className="dialog-btn-outline"
               onClick={() => void recoverChannelSession(channel.sessionId ?? channel.id)}
@@ -289,59 +216,7 @@ export function MembersPage() {
           </div>
         </Modal>
 
-        {/* Join Channel Pure React Modal */}
-        <Modal
-          isOpen={showJoinModal}
-          onClose={() => setShowJoinModal(false)}
-          title="Join Channel"
-        >
-          <form
-            onSubmit={(e) => void handleJoinSubmit(e)}
-            style={{ display: 'grid', gap: '14px' }}
-          >
-            <p style={{ color: 'var(--nodic-muted)', fontSize: '13px', margin: '0 0 6px' }}>
-              Paste the invitation code received from your channel lead.
-            </p>
-
-            <div>
-              <label style={{ display: 'block', marginBottom: '6px', fontWeight: 600, fontSize: '13px' }}>Your Display Name</label>
-              <input
-                type="text"
-                value={joinNameInput}
-                onChange={(e) => setJoinNameInput(e.target.value)}
-                placeholder={identity?.displayName || 'e.g. Rocket Puncher'}
-                style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: '1px solid var(--nodic-line)', background: 'white' }}
-              />
-            </div>
-
-            <div>
-              <label style={{ display: 'block', marginBottom: '6px', fontWeight: 600, fontSize: '13px' }}>Invitation Code *</label>
-              <textarea
-                rows={3}
-                required
-                value={joinCodeInput}
-                onChange={(e) => setJoinCodeInput(e.target.value)}
-                placeholder="nodic:v1:..."
-                style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: '1px solid var(--nodic-line)', background: 'white', fontFamily: 'monospace', fontSize: '12px' }}
-              />
-            </div>
-
-            {joinStatus && (
-              <div style={{ padding: '10px', borderRadius: '8px', background: joinStatus.startsWith('Error') ? '#ffeef0' : '#eaf8f4', color: joinStatus.startsWith('Error') ? '#b3261e' : '#146c54', fontSize: '13px' }}>
-                {joinStatus}
-              </div>
-            )}
-
-            <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', marginTop: '8px' }}>
-              <button type="button" className="dialog-btn-outline" onClick={() => setShowJoinModal(false)}>
-                Cancel
-              </button>
-              <button type="submit" className="dialog-btn-primary" disabled={!joinCodeInput.trim()}>
-                Submit
-              </button>
-            </div>
-          </form>
-        </Modal>
+        <JoinChannelModal isOpen={showJoinModal} onClose={() => setShowJoinModal(false)} />
 
         {/* Remove Member Pure React Confirmation Dialog */}
         <ConfirmDialog

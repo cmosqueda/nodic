@@ -1,4 +1,4 @@
-import { useState, type PropsWithChildren, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type PropsWithChildren, type FormEvent } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { chatbubbleEllipsesOutline, peopleOutline, pulseOutline, gridOutline } from 'ionicons/icons';
 import { IonIcon } from '@ionic/react';
@@ -36,6 +36,22 @@ export function AppShell({ children }: PropsWithChildren) {
   const [newChannelName, setNewChannelName] = useState('');
   const [newChannelDesc, setNewChannelDesc] = useState('');
   const location = useLocation();
+  const navRef = useRef<HTMLElement>(null);
+
+  // Publish the real bottom-bar height so page content can always scroll clear of it.
+  useEffect(() => {
+    const nav = navRef.current;
+    if (!nav) return;
+    const apply = () => {
+      const h = nav.getBoundingClientRect().height;
+      if (h > 0) document.documentElement.style.setProperty('--nav-h', `${Math.ceil(h)}px`);
+    };
+    apply();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(apply);
+    ro.observe(nav);
+    return () => ro.disconnect();
+  }, []);
   const isChatPage = location.pathname === '/chat';
 
   function handleOpenProfile() {
@@ -221,7 +237,7 @@ export function AppShell({ children }: PropsWithChildren) {
       <main className={`main-stage ${isChatPage ? 'is-chat-stage' : ''}`}>{children}</main>
 
       {/* Mobile/Tablet Bottom Navigation Bar (Board | Chat | Members) */}
-      <nav className="mobile-nav" aria-label="Primary navigation">
+      <nav ref={navRef} className="mobile-nav" aria-label="Primary navigation">
         {navItems.map((item) => (
           <NavLink key={item.to} to={item.to} className={({ isActive }) => isActive ? 'is-active' : undefined}>
             <IonIcon icon={item.icon} aria-hidden="true" />

@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Nodic – Guided Flow Prototype</title>
+<style>
+:root{--ink:#102d3d;--paper:#f4f8f9;--line:#d5e2e6;--sig:#19b394;--cur:#0b7a9e;--muted:#5d7783;--bad:#b3261e;--nav-h:64px}
+*{box-sizing:border-box}
+body{margin:0;background:#dfe9ec;font:14px/1.4 system-ui,sans-serif;color:var(--ink);display:flex;justify-content:center}
+#phone{position:relative;width:100%;max-width:420px;height:100dvh;background:var(--paper);overflow:hidden;display:flex;flex-direction:column}
+header{flex:none;background:var(--ink);color:#fff;padding:10px 14px;display:flex;align-items:center;gap:8px}
+header b{flex:1;font-size:16px} header small{opacity:.7;display:block;font-weight:400;font-size:11px}
+.iconbtn{background:#ffffff22;border:0;color:#fff;border-radius:8px;padding:6px 10px;font-size:13px}
+#stage{flex:1;overflow-y:auto;padding:14px 14px calc(var(--nav-h) + 24px)} /* FIX: nav-h + gap, never hidden */
+nav{position:absolute;left:0;right:0;bottom:0;height:var(--nav-h);background:var(--ink);display:grid;grid-template-columns:repeat(4,1fr);z-index:10;padding-bottom:env(safe-area-inset-bottom)}
+nav button{background:none;border:0;color:#9fb8c3;font-size:11px;display:grid;place-items:center;gap:0}
+nav button span{font-size:20px} nav button.on{color:#fff;font-weight:700}
+.card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
+h2{margin:0 0 6px;font-size:17px} h3{margin:0 0 8px;font-size:14px} p{margin:0 0 10px;color:var(--muted)}
+.btn{border:0;border-radius:10px;padding:11px 14px;font-weight:600;font-size:14px;background:var(--cur);color:#fff;width:100%}
+.btn.o{background:#fff;color:var(--cur);border:1px solid var(--cur)} .btn.s{width:auto;padding:7px 12px;font-size:13px}
+.btn:disabled{opacity:.45} .row{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--line)}
+.row:first-of-type{border-top:0} .row>div{flex:1} .row small{color:var(--muted);display:block;font-size:12px}
+.av{width:36px;height:36px;border-radius:50%;background:var(--sig);color:#fff;display:grid;place-items:center;font-weight:700;flex:none}
+input{width:100%;padding:11px;border:1px solid var(--line);border-radius:10px;font-size:15px;margin-bottom:10px;font-family:inherit}
+.code{font:700 26px monospace;letter-spacing:6px;text-align:center;background:#e8f2f4;border-radius:12px;padding:14px;margin:8px 0 12px}
+.msg{padding:10px;border-radius:10px;margin:8px 0;font-size:13px}.ok{background:#eaf8f4;color:#146c54}.err{background:#ffeef0;color:var(--bad)}.wait{background:#fff6dd;color:#7a5b00}
+.pill{font-size:11px;padding:2px 8px;border-radius:99px;background:#e8f2f4;color:var(--cur);font-weight:700}
+.kcol{background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px;margin-bottom:10px}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:9px;margin-top:8px}
+.bubble{max-width:80%;padding:8px 12px;border-radius:14px;margin:6px 0;background:#fff;border:1px solid var(--line)}
+.bubble.me{margin-left:auto;background:var(--cur);color:#fff;border:0}
+.composer{display:flex;gap:8px;margin-top:10px}.composer input{margin:0}
+.sheet{position:absolute;inset:0;background:#102d3d88;z-index:20;display:flex;align-items:flex-end}
+.sheet>div{background:#fff;width:100%;border-radius:20px 20px 0 0;padding:18px 16px calc(18px + env(safe-area-inset-bottom));max-height:88%;overflow:auto}
+details{margin-top:6px} summary{color:var(--cur);font-weight:600;padding:6px 0}
+/* guide coach-mark */
+#coach{position:absolute;left:10px;right:10px;bottom:calc(var(--nav-h) + 10px);z-index:30;background:#ffd84d;color:#3d3000;border-radius:14px;padding:12px;box-shadow:0 6px 20px #0004;display:none}
+#coach b{display:block;margin-bottom:2px} #coach .bar{display:flex;gap:8px;margin-top:8px;align-items:center}
+#coach button{border:0;border-radius:8px;padding:6px 12px;font-weight:700;background:#3d3000;color:#ffd84d}
+#coach button.g{background:none;color:#3d3000;text-decoration:underline}
+.hl{outline:3px solid #ffd84d;outline-offset:2px;animation:p 1.2s infinite}@keyframes p{50%{outline-color:#ffd84d00}}
+#role{font-size:11px}
+</style>
+</head>
+<body>
+<div id="phone">
+  <header><b id="title">Nodic<small id="sub"></small></b>
+    <button class="iconbtn" id="roleBtn" title="Switch which phone you are previewing">👤 Alex</button>
+    <button class="iconbtn" id="guideBtn">? Guide</button></header>
+  <div id="stage"></div>
+  <div id="coach"></div>
+  <nav id="nav"></nav>
+</div>
+
+<script>
+/* ---------- state: two simulated phones ---------- */
+const S={
+  alex:{name:'Alex',id:'nodic-a1b2c3d4',ch:null,pending:null,connected:[],reqs:[],tab:'home',inviteCode:null,tasks:{todo:['Draft field report'],doing:[],done:[]},chat:[]},
+  bea :{name:'Bea', id:'nodic-e5f6g7h8',ch:null,pending:null,connected:[],reqs:[],tab:'home',inviteCode:null,tasks:{todo:[],doing:[],done:[]},chat:[]}
+};
+let me='alex'; const other=()=>me==='alex'?'bea':'alex';
+const $=s=>document.querySelector(s), st=()=>S[me];
+let guide=null; // {i}
+const toast=(t,c='ok')=>`<div class="msg ${c}">${t}</div>`;
+
+/* ---------- guided tour ---------- */
+const STEPS=[
+ {t:'Welcome 👋',d:'Nodic works with people near you – no internet or accounts. You are previewing “Alex’s” phone (top-right switches to Bea’s). Tap Next.',need:()=>true,go:'home'},
+ {t:'1 · Create a channel (Alex)',d:'One person is the Lead. Tap “Create channel”, name it, press Create.',need:()=>S.alex.ch,go:'home',hl:'#createBtn',who:'alex'},
+ {t:'2 · Invite',d:'Open Members and tap “Invite”. You get a short 6-character code. Tell it to Bea.',need:()=>S.alex.inviteCode,go:'members',hl:'#inviteBtn',who:'alex'},
+ {t:'3 · Switch to Bea’s phone',d:'Tap the 👤 button top-right to view Bea’s phone.',need:()=>me==='bea',hl:'#roleBtn'},
+ {t:'4 · Join with the code',d:'On Bea’s Home screen tap “Join with code”, type the code shown on Alex’s phone and press Join. No manual pairing step – Nodic connects automatically.',need:()=>S.bea.ch||S.bea.pending,go:'home',hl:'#joinBtn',who:'bea'},
+ {t:'5 · Lead approves',d:'Switch back to Alex. Bea appears under “Join requests”. Tap Approve.',need:()=>S.bea.ch,go:'members',hl:'#reqBox',who:'alex'},
+ {t:'6 · You’re connected 🎉',d:'Both phones now share Board and Chat. Try adding a task or sending a message, then switch phones to see it arrive.',need:()=>true,go:'board'},
+ {t:'Tip · Bottom bar',d:'Everything scrolls above the tab bar now – nothing is hidden behind it. That’s the end of the tour!',need:()=>true}
+];
+function coach(){
+  const c=$('#coach'); if(guide===null){c.style.display='none';return;}
+  const s=STEPS[guide],last=guide===STEPS.length-1,done=s.need();
+  c.style.display='block';
+  c.innerHTML=`<b>${s.t}</b>${s.d}<div class="bar"><span style="flex:1;font-size:11px">${guide+1}/${STEPS.length}</span>
+   <button class="g" onclick="guide=null;coach();render()">Exit</button>
+   <button onclick="nextStep()" ${done?'':'disabled style="opacity:.4"'}>${last?'Finish':done?'Next':'Do it ↑'}</button></div>`;
+  document.querySelectorAll('.hl').forEach(e=>e.classList.remove('hl'));
+  if(s.hl&&!done){const e=$(s.hl);if(e){e.classList.add('hl');e.scrollIntoView({block:'center'})}}
+}
+function nextStep(){ if(guide>=STEPS.length-1){guide=null;coach();return}
+  guide++; const s=STEPS[guide]; if(s.who&&me!==s.who){me=s.who} if(s.go)st().tab=s.go; render(); }
+$('#guideBtn').onclick=()=>{guide=0;st().tab='home';render()};
+$('#roleBtn').onclick=()=>{me=other();render()};
+
+/* ---------- views ---------- */
+function home(){
+  const p=st();
+  if(p.ch) return `<div class="card"><h2>${p.ch}</h2><p>You’re in this channel with ${S[other()].ch===p.ch?'Alex & Bea':'no one else yet'}.</p>
+    <button class="btn" onclick="st().tab='board';render()">Open Board</button></div>`;
+  if(p.pending) return `<div class="card"><h2>Waiting for approval…</h2>${toast('Request sent to the channel lead. This takes a few seconds once they open Nodic.','wait')}
+    <button class="btn o" onclick="cancelJoin()">Cancel</button>
+    <p style="margin-top:10px;font-size:12px">Nothing is added to your device until the lead approves ✔</p></div>`;
+  return `<div class="card"><h2>Hi ${p.name} 👋</h2><p>Start a team space, or join one a teammate invited you to.</p>
+    <button class="btn" id="createBtn" onclick="sheet('create')">＋ Create channel</button><div style="height:8px"></div>
+    <button class="btn o" id="joinBtn" onclick="sheet('join')">Join with code</button></div>
+    <div class="card"><h3>Your Nodic ID</h3><p>Share this only if a teammate asks for it.</p><div class="pill" style="font:600 14px monospace;padding:8px 12px">${p.id}</div></div>`;
+}
+function members(){
+  const p=st(); if(!p.ch) return `<div class="card"><h2>No channel yet</h2><p>Create or join one from Home.</p><button class="btn" onclick="st().tab='home';render()">Go to Home</button></div>`;
+  const lead=S.alex.ch===p.ch&&p.name==='Alex'?true:false;
+  const mem=[S.alex,S.bea].filter(x=>x.ch===p.ch);
+  let h=`<div class="card"><div style="display:flex;align-items:center;gap:8px"><h2 style="flex:1;margin:0">${p.ch}</h2>
+    ${lead?'<button class="btn s" id="inviteBtn" onclick="invite()">＋ Invite</button>':''}</div></div>`;
+  if(lead&&p.reqs.length) h+=`<div class="card" id="reqBox"><h3>Join requests</h3>${p.reqs.map(r=>`<div class="row"><div class="av">${r[0]}</div><div><b>${r}</b><small>entered your invite code</small></div>
+    <button class="btn s" onclick="approve('${r.toLowerCase()}')">Approve</button> <button class="btn s o" onclick="reject('${r.toLowerCase()}')">✕</button></div>`).join('')}</div>`;
+  h+=`<div class="card"><h3>Members (${mem.length})</h3>${mem.map(m=>`<div class="row"><div class="av">${m.name[0]}</div><div><b>${m.name}${m===p?' (you)':''}</b><small>${m.name==='Alex'?'Lead':'Member'} · online</small></div></div>`).join('')}</div>`;
+  if(lead&&p.inviteCode) h+=`<div class="card"><h3>Active invite</h3><div class="code">${p.inviteCode}</div><p>Single use · expires in 24 h</p></div>`;
+  return h;
+}
+function board(){
+  const p=st(); if(!p.ch) return members();
+  const t=S[p.name==='Alex'?'alex':'bea'].ch===S.alex.ch?S.alex.tasks:p.tasks; // shared when same channel
+  const cols=[['todo','To do'],['doing','In progress'],['done','Done']];
+  return `<div class="card"><div class="composer"><input id="nt" placeholder="New task…"><button class="btn s" onclick="addTask()">Add</button></div></div>`+
+  cols.map(([k,l])=>`<div class="kcol"><h3>${l} <span class="pill">${t[k].length}</span></h3>${t[k].map((x,i)=>`<div class="task">${x}
+    <div style="margin-top:6px">${k!=='todo'?`<button class="btn s o" onclick="mv('${k}',${i},-1)">←</button> `:''}${k!=='done'?`<button class="btn s o" onclick="mv('${k}',${i},1)">→</button>`:''}</div></div>`).join('')||'<small style="color:var(--muted)">Empty</small>'}</div>`).join('')+
+  `<div class="msg ok">↓ Last item is fully visible above the tab bar.</div>`;
+}
+function chat(){
+  const p=st(); if(!p.ch) return members();
+  const msgs=S.alex.chat; // shared channel history
+  return `<div class="card">${msgs.map(m=>`<div class="bubble ${m.by===p.name?'me':''}"><small>${m.by}</small><br>${m.t}</div>`).join('')||'<p>No messages yet. Say hi!</p>'}
+   <div class="composer"><input id="mt" placeholder="Message…" onkeydown="if(event.key==='Enter')send()"><button class="btn s" onclick="send()">Send</button></div></div>`;
+}
+function network(){
+  const p=st(),o=S[other()],isC=p.connected.includes(o.id);
+  return `<div class="card"><h2>Network</h2>${toast(isC?`Connected to ${o.name}`:'Not connected to anyone yet',isC?'ok':'wait')}
+  <p>Joining a channel connects you automatically. You only need this page to find people manually.</p></div>
+  <div class="card"><h3>People nearby</h3><div class="row"><div class="av">${o.name[0]}</div><div><b>${o.name}</b><small>${o.id}</small></div>
+   ${isC?'<span class="pill">Connected</span>':`<button class="btn s" onclick="connect()">Connect</button>`}</div></div>
+  <div class="card"><h3>My ID</h3><div class="pill" style="font:600 14px monospace;padding:8px 12px">${p.id}</div></div>
+  <details class="card"><summary>Advanced</summary><p>Connect by Nodic ID, saved connections, and sync logs live here – hidden by default.</p>
+   <input placeholder="nodic-xxxxxxxx"><button class="btn o">Connect by ID</button></details>`;
+}
+/* ---------- actions ---------- */
+function sheet(kind){
+  let h='';
+  if(kind==='create') h=`<h2>Create channel</h2><input id="cn" placeholder="e.g. Greenfield Dept." autofocus><button class="btn" onclick="create()">Create</button>`;
+  if(kind==='join') h=`<h2>Join with code</h2><p>Ask the channel lead for their 6-character code.</p><input id="jn" placeholder="Your name" value="${st().name}">
+    <input id="jc" placeholder="e.g. K7M2QX" maxlength="6" style="text-transform:uppercase;font:700 20px monospace;letter-spacing:4px;text-align:center"><div id="jmsg"></div>
+    <button class="btn" onclick="join()">Join</button><div style="height:8px"></div><button class="btn o" onclick="closeSheet()">Cancel</button>`;
+  const d=document.createElement('div');d.className='sheet';d.id='sheet';d.innerHTML=`<div>${h}</div>`;
+  d.onclick=e=>{if(e.target===d)closeSheet()};$('#phone').appendChild(d);
+}
+function closeSheet(){const s=$('#sheet');if(s)s.remove()}
+function create(){const n=$('#cn').value.trim();if(!n)return;st().ch=n;closeSheet();st().tab='members';render()}
+function invite(){const c=Array.from({length:6},()=>'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[Math.random()*32|0]).join('');st().inviteCode=c;render()}
+function join(){
+  const code=$('#jc').value.trim().toUpperCase(),lead=S.alex,m=$('#jmsg');
+  if(code.length<6){m.innerHTML=toast('Code must be 6 characters.','err');return}
+  if(!lead.inviteCode){m.innerHTML=toast('That code isn’t valid or was already used. Ask the lead for a new one.','err');return}
+  if(code!==lead.inviteCode){m.innerHTML=toast('Code doesn’t match. Check for typos (no 0/O, 1/I).','err');return}
+  // auto-connect + pending (no channel created until approved)
+  st().connected.push(lead.id);lead.connected.push(st().id);
+  st().pending=lead.ch;lead.reqs.push(st().name);closeSheet();st().tab='home';render();
+}
+function cancelJoin(){const p=st();p.pending=null;S.alex.reqs=S.alex.reqs.filter(r=>r!==p.name);render()}
+function approve(k){const m=S[k];m.ch=S.alex.ch;m.pending=null;S.alex.reqs=S.alex.reqs.filter(r=>r.toLowerCase()!==k);S.alex.inviteCode=null;render()}
+function reject(k){S[k].pending=null;S.alex.reqs=S.alex.reqs.filter(r=>r.toLowerCase()!==k);render()}
+function connect(){const p=st(),o=S[other()];p.connected.push(o.id);o.connected.push(p.id);render()}
+function addTask(){const v=$('#nt').value.trim();if(v){S.alex.tasks.todo.push(v);render()}}
+function mv(k,i,d){const t=S.alex.tasks,o=['todo','doing','done'],to=o[o.indexOf(k)+d];t[to].push(t[k].splice(i,1)[0]);render()}
+function send(){const v=$('#mt').value.trim();if(v){S.alex.chat.push({by:st().name,t:v});render()}}
+
+/* ---------- shell ---------- */
+const TABS=[['home','🏠','Home'],['board','🗂','Board'],['chat','💬','Chat'],['members','👥','Members']];
+function render(){
+  const p=st();$('#roleBtn').textContent='👤 '+p.name;
+  $('#title').firstChild.textContent='Nodic';$('#sub').textContent=p.ch?p.ch:(p.pending?'Waiting for approval':'No channel');
+  const v={home,board,chat,members,network}[p.tab]();
+  $('#stage').innerHTML=v+(p.tab==='home'?`<div class="card"><button class="btn o" onclick="st().tab='network';render()">Network & connections</button></div>`:'');
+  $('#nav').innerHTML=TABS.map(([k,i,l])=>`<button class="${p.tab===k?'on':''}" onclick="st().tab='${k}';render()"><span>${i}</span>${l}</button>`).join('');
+  coach();
+  if(guide!==null&&STEPS[guide].need()&&guide<STEPS.length-1&&[1,2,4,5].includes(guide)) {/* wait for user to press Next */}
+}
+render();
+</script>
+</body>
+</html>

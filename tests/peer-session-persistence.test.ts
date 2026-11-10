@@ -548,5 +548,37 @@ describe('Two-Peer Identity, Session, Log & Event Synchronization', () => {
 
     // Only admitted member B is in channel recipients; paired peer C is excluded
     expect(repoA.getChannelRecipientIds(alphaChannelId)).toEqual([idB.deviceId]);
+
+    // The lead answers with a transient JOIN_ACCEPTED carrying the channel key (never stored in history)
+    const acceptance = await repoA.buildJoinResponseEvent(alphaChannelId, idB.deviceId, { accepted: true });
+    expect(acceptance.type).toBe('JOIN_ACCEPTED');
+    const accPayload = acceptance.payload as { applicantDeviceId: string; channelKey?: string; keyVersion?: number };
+    expect(accPayload.applicantDeviceId).toBe(idB.deviceId);
+    expect(accPayload.channelKey).toBeTruthy();
+    repoB.installChannelKey(alphaChannelId, accPayload.keyVersion ?? 1, accPayload.channelKey!);
+    expect(repoB.getChannelKey(alphaChannelId, accPayload.keyVersion ?? 1)).toBe(accPayload.channelKey);
+
+    // A retry from an already admitted member is re-acknowledged without consuming a new invite
+    const retryFromB = await repoB.buildJoinRequestEvent(alphaChannelId, {
+      invitationId: parsedForB.invitation.invitationId,
+      joinSecret: parsedForB.invitation.joinSecret,
+    });
+    const retryOutcome = await repoA.handleIncomingJoinRequest(retryFromB);
+    expect(retryOutcome).toMatchObject({ accepted: true, alreadyMember: true });
+
+    // C reusing B's already-consumed invite is rejected, and the lead can say why
+    const reuseFromC = await repoC.buildJoinRequestEvent(alphaChannelId, {
+      invitationId: parsedForB.invitation.invitationId,
+      joinSecret: parsedForB.invitation.joinSecret,
+    });
+    const reuseOutcome = await repoA.handleIncomingJoinRequest(reuseFromC);
+    expect(reuseOutcome.accepted).toBe(false);
+    const rejection = await repoA.buildJoinResponseEvent(alphaChannelId, idC.deviceId, {
+      accepted: false,
+      reason: reuseOutcome.reason ?? 'declined',
+    });
+    expect(rejection.type).toBe('JOIN_REJECTED');
+    expect(repoA.getChannelRecipientIds(alphaChannelId)).toEqual([idB.deviceId]);
+    expect(repoA.hasActiveInvitation()).toBe(false);
   });
 });

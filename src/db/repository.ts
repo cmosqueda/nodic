@@ -2506,7 +2506,11 @@ export class NodicRepository {
 
     // Join requests are transient: they are evaluated by handleIncomingJoinRequest and never
     // become part of channel history.
-    if (event.type === 'JOIN_REQUESTED') {
+    if (
+      event.type === 'JOIN_REQUESTED' ||
+      event.type === 'JOIN_ACCEPTED' ||
+      event.type === 'JOIN_REJECTED'
+    ) {
       return this.loadWorkspace();
     }
 
@@ -3259,6 +3263,45 @@ export class NodicRepository {
     invitation: { invitationId: string; joinSecret: string },
   ): Promise<NodicEvent> {
     const identity = await this.getIdentity();
+    return this.buildTransientEvent(channelId, 'JOIN_REQUESTED', {
+      deviceId: identity.deviceId,
+      displayName: identity.displayName,
+      publicSigningKey: identity.publicSigningKey,
+      invitationId: invitation.invitationId,
+      joinProof: await hashSecret(invitation.joinSecret),
+    });
+  }
+
+  /**
+   * Lead side: signed, transient answer to a join request. Never stored in channel history.
+   * ACCEPTED carries the channel key so the new member can read history; REJECTED carries a reason.
+   */
+  async buildJoinResponseEvent(
+    channelId: string,
+    applicantDeviceId: string,
+    outcome: { accepted: true } | { accepted: false; reason: string },
+  ): Promise<NodicEvent> {
+    const payload: Record<string, unknown> = { applicantDeviceId };
+    if (outcome.accepted) {
+      const keyVersion = this.getActiveKeyVersion(channelId);
+      payload.keyVersion = keyVersion;
+      payload.channelKey = this.getChannelKey(channelId, keyVersion) ?? undefined;
+    } else {
+      payload.reason = outcome.reason;
+    }
+    return this.buildTransientEvent(
+      channelId,
+      outcome.accepted ? 'JOIN_ACCEPTED' : 'JOIN_REJECTED',
+      payload,
+    );
+  }
+
+  private async buildTransientEvent(
+    channelId: string,
+    type: 'JOIN_REQUESTED' | 'JOIN_ACCEPTED' | 'JOIN_REJECTED',
+    payload: Record<string, unknown>,
+  ): Promise<NodicEvent> {
+    const identity = await this.getIdentity();
     const eventWithoutSig: Omit<NodicEvent, 'signature'> = {
       protocolVersion: 1,
       id: crypto.randomUUID(),
@@ -3266,17 +3309,11 @@ export class NodicRepository {
       authorDeviceId: identity.deviceId,
       authorSequence: 1,
       lamportClock: identity.lamportClock,
-      type: 'JOIN_REQUESTED',
+      type,
       keyVersion: 1,
       createdAt: new Date().toISOString(),
       payloadVersion: 1,
-      payload: {
-        deviceId: identity.deviceId,
-        displayName: identity.displayName,
-        publicSigningKey: identity.publicSigningKey,
-        invitationId: invitation.invitationId,
-        joinProof: await hashSecret(invitation.joinSecret),
-      },
+      payload,
     };
     let signature = `sig-${identity.deviceId.slice(0, 8)}-join`;
     if (this.privateSigningKey) {
@@ -3289,6 +3326,21 @@ export class NodicRepository {
     return { ...eventWithoutSig, signature };
   }
 
+  /** Applicant side: stores the channel key delivered with an admission. */
+  installChannelKey(channelId: string, version: number, key: string): void {
+    this.setChannelKey(channelId, version, key);
+    this.persistLocalWorkspaceState();
+  }
+
+  /** True while at least one unexpired invitation exists (lead may auto-accept pairing then). */
+  hasActiveInvitation(): boolean {
+    const now = Date.now();
+    for (const inv of this.storedInvitations.values()) {
+      if (new Date(inv.expiresAt).getTime() > now) return true;
+    }
+    return false;
+  }
+
   /**
    * Lead side: validates a JOIN_REQUESTED event against the stored invitation and, if valid,
    * emits the signed MEMBER_ADDED event that actually admits the applicant.
@@ -3297,6 +3349,7 @@ export class NodicRepository {
     accepted: boolean;
     reason?: string;
     memberEvent?: NodicEvent;
+    alreadyMember?: boolean;
   }> {
     const identity = await this.getIdentity();
     const state = this.memoryChannels.get(event.channelId);
@@ -3318,6 +3371,11 @@ export class NodicRepository {
       !payload.publicSigningKey
     ) {
       return { accepted: false, reason: 'Malformed join request' };
+    }
+    // A current member re-sending a request (retry after a lost reply) is simply re-acknowledged
+    // without consuming another invite.
+    if (state.members.has(payload.deviceId) && !this.isAuthorRevoked(event.channelId, payload.deviceId)) {
+      return { accepted: true, alreadyMember: true };
     }
     if (
       payload.publicSigningKey.startsWith('p256:') &&

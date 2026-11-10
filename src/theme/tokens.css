@@ -1,4 +1,6 @@
 :root {
+  /* Bottom tab bar height. AppShell overwrites this with the measured value so content never hides behind it. */
+  --nav-h: calc(60px + env(safe-area-inset-bottom, 0px));
   --nodic-ink: #102d3d;
   --nodic-signal: #167a92;
   --nodic-current: #69c4c8;
